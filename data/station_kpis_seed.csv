@@ -1,0 +1,9 @@
+district,station_name,open_cases,breached_sla_cases,high_risk_entities,active_alerts,avg_anomaly,patrol_units_available,complaints_7d
+Chennai,Thousand Lights PS,34,5,18,9,0.73,6,41
+Chennai,T Nagar PS,29,4,12,7,0.66,5,33
+Coimbatore,RS Puram PS,17,2,7,4,0.48,4,19
+Madurai,Tallakulam PS,21,3,9,5,0.57,4,22
+Salem,Hasthampatti PS,14,1,5,3,0.42,3,14
+Tiruchirappalli,Cantonment PS,18,2,8,4,0.51,4,17
+Erode,Surampatti PS,12,1,4,2,0.39,3,11
+Tirunelveli,Palayamkottai PS,15,2,6,3,0.44,3,13

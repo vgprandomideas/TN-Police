@@ -1,0 +1,7 @@
+cluster_id,entity_id,entity_name,entity_type,case_id,district,signal_type,signal_strength,explanation
+CL-1001,1,Ravi Kumar,person,101,Chennai,phone_overlap,0.91,Shared mobile identifier across two complaints and one patrol observation
+CL-1001,5,KA01AB1234,vehicle,101,Chennai,co_travel,0.74,Vehicle appears in same geofence and watchlist hit stream
+CL-1001,12,Axis-9981,device,118,Chennai,device_overlap,0.88,Device fingerprint repeated across cyber complaint and field seizure
+CL-1002,7,Suresh Finance,organization,132,Coimbatore,bank_beneficiary,0.81,Repeated beneficiary reference in fraud complaints
+CL-1002,19,9840012345,phone,132,Coimbatore,contact_overlap,0.77,Phone reused across complaint narratives and assignment notes
+CL-1003,11,Warehouse-Red,location,141,Madurai,location_overlap,0.69,Location repeated across custody movement and evidence pickup logs

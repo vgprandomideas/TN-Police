@@ -1,0 +1,7 @@
+officer_name,rank,district,station_name,active_cases,new_assignments_7d,breached_sla_cases,avg_case_severity,capacity_index,recommended_action
+R. Prakash,Inspector,Chennai,Thousand Lights PS,14,5,2,4.3,0.88,Rebalance to neighboring station
+M. Saranya,Inspector,Chennai,T Nagar PS,11,4,1,4.1,0.76,Monitor only
+K. Naveen,DSP,Coimbatore,RS Puram PS,9,3,1,3.9,0.68,Healthy load
+A. Vinodh,Inspector,Madurai,Tallakulam PS,13,5,3,4.5,0.91,Escalate staffing
+S. Priya,Inspector,Salem,Hasthampatti PS,8,2,0,3.6,0.54,Healthy load
+V. Manikandan,Inspector,Erode,Surampatti PS,7,2,0,3.4,0.49,Healthy load

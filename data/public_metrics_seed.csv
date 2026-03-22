@@ -1,0 +1,10 @@
+year,district,metric_name,metric_value,unit,provenance,notes
+2023,Tamil Nadu,murders,1598,count,official_2023,Tamil Nadu SCRB review baseline
+2023,Tamil Nadu,cybercrime_complaints,4121,count,official_2023,Tamil Nadu SCRB review baseline
+2024,Tamil Nadu,murders,1489,count,public_partial_2024,Publicly reported statewide figure
+2024,Tamil Nadu,violent_crime_bodily_offences,31497,count,public_partial_2024,Publicly reported statewide figure
+2024,Tamil Nadu,cybercrime_complaints,130000,count,public_partial_2024,Publicly reported statewide figure
+2024,Tamil Nadu,cyber_firs,4380,count,public_partial_2024,Publicly reported statewide figure
+2024,Tamil Nadu,cyber_loss_inr_crore,1673.85,crore_inr,public_partial_2024,Publicly reported statewide figure
+2025,Tamil Nadu,cyber_crime_police_stations,54,count,policy_note_2025,Capability/infrastructure figure
+2025,Tamil Nadu,murders_q1,340,count,public_partial_2025,Partial year public figure

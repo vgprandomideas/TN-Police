@@ -1,0 +1,77 @@
+district,station_name,station_type,latitude,longitude
+Ariyalur,Ariyalur Central Station,Central,11.1485,79.0856
+Ariyalur,Ariyalur Cyber Crime PS,Cyber Crime,11.1235,79.08359999999999
+Chengalpattu,Chengalpattu Central Station,Central,12.7026,79.98700000000001
+Chengalpattu,Chengalpattu Cyber Crime PS,Cyber Crime,12.6776,79.985
+Chennai,Chennai Central Station,Central,13.0927,80.28070000000001
+Chennai,Chennai Cyber Crime PS,Cyber Crime,13.0677,80.2787
+Coimbatore,Coimbatore Central Station,Central,11.0268,76.9658
+Coimbatore,Coimbatore Cyber Crime PS,Cyber Crime,11.0018,76.96379999999999
+Cuddalore,Cuddalore Central Station,Central,11.7547,79.778
+Cuddalore,Cuddalore Cyber Crime PS,Cyber Crime,11.7297,79.776
+Dharmapuri,Dharmapuri Central Station,Central,12.1311,78.1682
+Dharmapuri,Dharmapuri Cyber Crime PS,Cyber Crime,12.1061,78.16619999999999
+Dindigul,Dindigul Central Station,Central,10.3773,77.9903
+Dindigul,Dindigul Cyber Crime PS,Cyber Crime,10.3523,77.9883
+Erode,Erode Central Station,Central,11.350999999999999,77.72720000000001
+Erode,Erode Cyber Crime PS,Cyber Crime,11.325999999999999,77.7252
+Kallakurichi,Kallakurichi Central Station,Central,11.748899999999999,78.9697
+Kallakurichi,Kallakurichi Cyber Crime PS,Cyber Crime,11.723899999999999,78.9677
+Kanchipuram,Kanchipuram Central Station,Central,12.844199999999999,79.7136
+Kanchipuram,Kanchipuram Cyber Crime PS,Cyber Crime,12.819199999999999,79.71159999999999
+Kanyakumari,Kanyakumari Central Station,Central,8.0983,77.5485
+Kanyakumari,Kanyakumari Cyber Crime PS,Cyber Crime,8.0733,77.5465
+Karur,Karur Central Station,Central,10.9701,78.0866
+Karur,Karur Cyber Crime PS,Cyber Crime,10.9451,78.0846
+Krishnagiri,Krishnagiri Central Station,Central,12.528599999999999,78.22370000000001
+Krishnagiri,Krishnagiri Cyber Crime PS,Cyber Crime,12.503599999999999,78.2217
+Madurai,Madurai Central Station,Central,9.9352,78.1298
+Madurai,Madurai Cyber Crime PS,Cyber Crime,9.9102,78.1278
+Mayiladuthurai,Mayiladuthurai Central Station,Central,11.1135,79.665
+Mayiladuthurai,Mayiladuthurai Cyber Crime PS,Cyber Crime,11.0885,79.663
+Nagapattinam,Nagapattinam Central Station,Central,10.775599999999999,79.8528
+Nagapattinam,Nagapattinam Cyber Crime PS,Cyber Crime,10.750599999999999,79.85079999999999
+Namakkal,Namakkal Central Station,Central,11.2294,78.1774
+Namakkal,Namakkal Cyber Crime PS,Cyber Crime,11.2044,78.1754
+Nilgiris,Nilgiris Central Station,Central,11.4202,76.705
+Nilgiris,Nilgiris Cyber Crime PS,Cyber Crime,11.395199999999999,76.70299999999999
+Perambalur,Perambalur Central Station,Central,11.2433,78.89330000000001
+Perambalur,Perambalur Cyber Crime PS,Cyber Crime,11.2183,78.8913
+Pudukkottai,Pudukkottai Central Station,Central,10.3897,78.83080000000001
+Pudukkottai,Pudukkottai Cyber Crime PS,Cyber Crime,10.3647,78.8288
+Ramanathapuram,Ramanathapuram Central Station,Central,9.373899999999999,78.8495
+Ramanathapuram,Ramanathapuram Cyber Crime PS,Cyber Crime,9.348899999999999,78.8475
+Ranipet,Ranipet Central Station,Central,12.9373,79.343
+Ranipet,Ranipet Cyber Crime PS,Cyber Crime,12.9123,79.341
+Salem,Salem Central Station,Central,11.6743,78.156
+Salem,Salem Cyber Crime PS,Cyber Crime,11.6493,78.154
+Sivagangai,Sivagangai Central Station,Central,9.8577,78.4936
+Sivagangai,Sivagangai Cyber Crime PS,Cyber Crime,9.832699999999999,78.49159999999999
+Tenkasi,Tenkasi Central Station,Central,8.969,77.32520000000001
+Tenkasi,Tenkasi Cyber Crime PS,Cyber Crime,8.943999999999999,77.3232
+Thanjavur,Thanjavur Central Station,Central,10.7967,79.1478
+Thanjavur,Thanjavur Cyber Crime PS,Cyber Crime,10.7717,79.1458
+Theni,Theni Central Station,Central,10.0204,77.4868
+Theni,Theni Cyber Crime PS,Cyber Crime,9.9954,77.48479999999999
+Thoothukudi,Thoothukudi Central Station,Central,8.7742,78.1448
+Thoothukudi,Thoothukudi Cyber Crime PS,Cyber Crime,8.7492,78.1428
+Tiruchirappalli,Tiruchirappalli Central Station,Central,10.8005,78.71470000000001
+Tiruchirappalli,Tiruchirappalli Cyber Crime PS,Cyber Crime,10.7755,78.7127
+Tirunelveli,Tirunelveli Central Station,Central,8.7239,77.7667
+Tirunelveli,Tirunelveli Cyber Crime PS,Cyber Crime,8.6989,77.76469999999999
+Tirupathur,Tirupathur Central Station,Central,12.5053,78.57780000000001
+Tirupathur,Tirupathur Cyber Crime PS,Cyber Crime,12.4803,78.5758
+Tiruppur,Tiruppur Central Station,Central,11.1185,77.3511
+Tiruppur,Tiruppur Cyber Crime PS,Cyber Crime,11.093499999999999,77.34909999999999
+Tiruvallur,Tiruvallur Central Station,Central,13.1539,79.9187
+Tiruvallur,Tiruvallur Cyber Crime PS,Cyber Crime,13.1289,79.91669999999999
+Tiruvannamalai,Tiruvannamalai Central Station,Central,12.2353,79.08470000000001
+Tiruvannamalai,Tiruvannamalai Cyber Crime PS,Cyber Crime,12.2103,79.0827
+Tiruvarur,Tiruvarur Central Station,Central,10.7822,79.6468
+Tiruvarur,Tiruvarur Cyber Crime PS,Cyber Crime,10.7572,79.64479999999999
+Vellore,Vellore Central Station,Central,12.926499999999999,79.1425
+Vellore,Vellore Cyber Crime PS,Cyber Crime,12.901499999999999,79.14049999999999
+Viluppuram,Viluppuram Central Station,Central,11.950099999999999,79.4961
+Viluppuram,Viluppuram Cyber Crime PS,Cyber Crime,11.925099999999999,79.49409999999999
+Virudhunagar,Virudhunagar Central Station,Central,9.5951,77.9679
+Virudhunagar,Virudhunagar Cyber Crime PS,Cyber Crime,9.5701,77.96589999999999

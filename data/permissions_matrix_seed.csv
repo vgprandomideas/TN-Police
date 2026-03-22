@@ -1,0 +1,5 @@
+role_name,can_view_dashboard,can_create_case,can_assign_case,can_add_evidence,can_manage_watchlist,can_manage_users,can_export_briefing,can_close_case
+admin_tn,1,1,1,1,1,1,1,1
+cyber_analyst,1,1,1,1,1,0,1,0
+district_sp,1,1,1,1,1,0,1,1
+viewer,1,0,0,0,0,0,0,0

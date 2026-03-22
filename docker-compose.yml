@@ -1,0 +1,95 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16
+    container_name: tn-police-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tn_police
+      POSTGRES_USER: tnpolice
+      POSTGRES_PASSWORD: tnpolice
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tnpolice -d tn_police"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: infra/docker/backend.Dockerfile
+    container_name: tn-police-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://tnpolice:tnpolice@postgres:5432/tn_police}
+      JWT_SECRET: ${JWT_SECRET:-change-me-final}
+      TOKEN_EXPIRE_MINUTES: ${TOKEN_EXPIRE_MINUTES:-480}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      sh -c "python -m db.init_db && python scripts/seed_demo.py && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/docker/backend.Dockerfile
+    container_name: tn-police-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://tnpolice:tnpolice@postgres:5432/tn_police}
+      JWT_SECRET: ${JWT_SECRET:-change-me-final}
+      TOKEN_EXPIRE_MINUTES: ${TOKEN_EXPIRE_MINUTES:-480}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      sh -c "python -m db.init_db && python scripts/seed_demo.py && python scripts/run_worker.py"
+    volumes:
+      - ./:/app
+
+  frontend:
+    build:
+      context: .
+      dockerfile: infra/docker/frontend.Dockerfile
+    container_name: tn-police-frontend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      API_BASE_URL: http://api:8000
+    depends_on:
+      - api
+    command: >
+      sh -c "streamlit run frontend/frontend_app.py --server.port 8501 --server.address 0.0.0.0"
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: tn-police-nginx
+    restart: unless-stopped
+    depends_on:
+      - api
+      - frontend
+    ports:
+      - "8080:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+volumes:
+  postgres_data:

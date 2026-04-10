@@ -35,7 +35,7 @@ This package does **not** fake privileged access to CCTNS, FIR, CCTV, or other r
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r backend-requirements.txt -r requirements.txt
 python -m db.init_db
 python scripts/seed_demo.py
 uvicorn app.main:app --reload
@@ -87,7 +87,7 @@ Because the entrypoint is inside `frontend/`, Community Cloud will use `frontend
 ### Render backend
 
 This repo includes `render.yaml` for the API service. You can deploy it as a Blueprint or create a web service manually with:
-- Build Command: `pip install -r requirements.txt`
+- Build Command: `pip install -r backend-requirements.txt`
 - Start Command: `python -m db.init_db && python scripts/seed_demo.py && uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 - Health Check Path: `/health`
 - Python Version: `3.13`
@@ -97,7 +97,7 @@ After deploy, copy the Render service URL and set it as `API_URL` in Streamlit.
 ### Railway backend
 
 This repo includes `railway.toml` for the API service. If you configure it manually, use:
-- Build Command: `pip install -r requirements.txt`
+- Build Command: `pip install -r backend-requirements.txt`
 - Start Command: `python -m db.init_db && python scripts/seed_demo.py && uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 - Health Check Path: `/health`
 

@@ -88,6 +88,7 @@ This repo includes `render.yaml` for the API service. You can deploy it as a Blu
 - Build Command: `pip install -r requirements.txt`
 - Start Command: `python -m db.init_db && python scripts/seed_demo.py && uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 - Health Check Path: `/health`
+- Python Version: `3.13`
 
 After deploy, copy the Render service URL and set it as `API_URL` in Streamlit.
 

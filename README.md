@@ -73,6 +73,7 @@ Use these settings:
 - Repository: `vgprandomideas/TN-Police`
 - Branch: `main`
 - Main file path: `frontend/frontend_app.py`
+- Python version: `3.13` or `3.12`
 
 Add this secret in the Streamlit app settings:
 
@@ -81,6 +82,7 @@ API_URL = "https://your-backend-url"
 ```
 
 The Streamlit app now reads `API_URL` from either an environment variable or Streamlit secrets.
+Because the entrypoint is inside `frontend/`, Community Cloud will use `frontend/requirements.txt` first for the Streamlit deployment.
 
 ### Render backend
 

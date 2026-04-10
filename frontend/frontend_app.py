@@ -18,7 +18,6 @@ st.set_page_config(
     layout="wide",
 )
 
-DEFAULT_API_URL = os.getenv("API_URL", "http://localhost:8000")
 APP_DIR = Path(__file__).resolve().parent
 TN_DISTRICT_COORDS_PATH = APP_DIR.parent / "data" / "tn_district_coordinates.csv"
 TN_STATE_OUTLINE = [
@@ -61,9 +60,22 @@ TN_MAP_VIEW_STATE = pdk.ViewState(latitude=10.85, longitude=78.62, zoom=6.35, pi
 # ----------------------------
 # Helpers
 # ----------------------------
+def resolve_api_url() -> str:
+    env_api_url = os.getenv("API_URL", "").strip()
+    if env_api_url:
+        return env_api_url
+
+    try:
+        secrets_api_url = str(st.secrets.get("API_URL", "")).strip()
+    except Exception:
+        secrets_api_url = ""
+
+    return secrets_api_url or "http://localhost:8000"
+
+
 def get_api_url() -> str:
     if "api_url" not in st.session_state:
-        st.session_state.api_url = DEFAULT_API_URL
+        st.session_state.api_url = resolve_api_url()
     return st.session_state.api_url.rstrip("/")
 
 

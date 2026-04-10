@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: tn-police-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m db.init_db && python scripts/seed_demo.py && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        value: sqlite:///./tn_police_final.db
+      - key: JWT_SECRET
+        generateValue: true

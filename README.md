@@ -59,6 +59,53 @@ docker compose up --build
 - API: `http://localhost:8000`
 - Reverse proxied entry: `http://localhost:8080`
 
+## Cloud deployment
+
+This repo is a two-service app:
+- Streamlit frontend: `frontend/frontend_app.py`
+- FastAPI backend: `app/main.py`
+
+If you deploy only the Streamlit app, it will not work because the UI calls the API for login, dashboard data, heatmaps, dossier data, and admin actions.
+
+### Streamlit Community Cloud
+
+Use these settings:
+- Repository: `vgprandomideas/TN-Police`
+- Branch: `main`
+- Main file path: `frontend/frontend_app.py`
+
+Add this secret in the Streamlit app settings:
+
+```toml
+API_URL = "https://your-backend-url"
+```
+
+The Streamlit app now reads `API_URL` from either an environment variable or Streamlit secrets.
+
+### Render backend
+
+This repo includes `render.yaml` for the API service. You can deploy it as a Blueprint or create a web service manually with:
+- Build Command: `pip install -r requirements.txt`
+- Start Command: `python -m db.init_db && python scripts/seed_demo.py && uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Health Check Path: `/health`
+
+After deploy, copy the Render service URL and set it as `API_URL` in Streamlit.
+
+### Railway backend
+
+This repo includes `railway.toml` for the API service. If you configure it manually, use:
+- Build Command: `pip install -r requirements.txt`
+- Start Command: `python -m db.init_db && python scripts/seed_demo.py && uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Health Check Path: `/health`
+
+### Why the hosted site can stay stuck loading
+
+Common causes:
+- The Streamlit app is deployed without the FastAPI backend.
+- `API_URL` is not set, so Streamlit falls back to `http://localhost:8000`.
+- The backend host is sleeping or cold-starting, so the frontend waits for the API to wake up.
+- Free-tier deployments with SQLite are demo-friendly, but the database is recreated on new instances or redeploys.
+
 ## Demo credentials
 - `admin_tn / admin123`
 - `cyber_analyst / cyber123`

@@ -54,6 +54,7 @@ def log_action(db: Session, username: str, action: str, object_type: str, object
 def add_timeline(db: Session, case_id: int, event_type: str, actor: str, details: str):
     db.add(CaseTimelineEvent(case_id=case_id, event_type=event_type, actor=actor, details=details))
 
+@app.get('/')
 @app.get('/health')
 def health():
     return {"status": "ok", "version": "final"}

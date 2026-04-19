@@ -1,3 +1,4 @@
+import time
 from typing import Any, Dict
 
 import requests
@@ -14,7 +15,7 @@ def safe_json(resp: requests.Response) -> Any:
         }
 
 
-def request_login(api_url: str, username: str, password: str, timeout: int = 20) -> Dict[str, Any]:
+def request_login(api_url: str, username: str, password: str, timeout: int = 75) -> Dict[str, Any]:
     base_url = api_url.rstrip("/")
     attempts = [
         {
@@ -37,31 +38,48 @@ def request_login(api_url: str, username: str, password: str, timeout: int = 20)
         "data": {"error": "No compatible login endpoint responded"},
         "path": None,
     }
+    timeout_steps = [min(timeout, 20), min(timeout, 45), timeout]
 
     for attempt in attempts:
-        try:
-            resp = requests.post(
-                f"{base_url}{attempt['path']}",
-                timeout=timeout,
-                **attempt["request_kwargs"],
-            )
-        except requests.RequestException as exc:
-            return {
-                "ok": False,
-                "status_code": None,
-                "data": {"error": f"Login failed: {str(exc)}"},
+        for timeout_value in dict.fromkeys(timeout_steps):
+            try:
+                resp = requests.post(
+                    f"{base_url}{attempt['path']}",
+                    timeout=timeout_value,
+                    **attempt["request_kwargs"],
+                )
+            except requests.Timeout:
+                last_result = {
+                    "ok": False,
+                    "status_code": None,
+                    "data": {
+                        "error": (
+                            f"Login timed out while waking the backend at {attempt['path']}. "
+                            f"Tried waiting up to {timeout_value} seconds."
+                        )
+                    },
+                    "path": attempt["path"],
+                }
+                time.sleep(2)
+                continue
+            except requests.RequestException as exc:
+                return {
+                    "ok": False,
+                    "status_code": None,
+                    "data": {"error": f"Login failed: {str(exc)}"},
+                    "path": attempt["path"],
+                }
+
+            data = safe_json(resp)
+            result = {
+                "ok": resp.ok,
+                "status_code": resp.status_code,
+                "data": data,
                 "path": attempt["path"],
             }
-
-        data = safe_json(resp)
-        result = {
-            "ok": resp.ok,
-            "status_code": resp.status_code,
-            "data": data,
-            "path": attempt["path"],
-        }
-        if resp.ok or resp.status_code not in fallback_statuses:
-            return result
-        last_result = result
+            if resp.ok or resp.status_code not in fallback_statuses:
+                return result
+            last_result = result
+            break
 
     return last_result

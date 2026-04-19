@@ -26,6 +26,7 @@ DEMO_CREDENTIALS = (
     "district_sp / district123\n"
     "viewer / viewer123"
 )
+REQUEST_TIMEOUT = 75
 
 
 def normalize_api_url(value: str) -> str:
@@ -95,7 +96,7 @@ def handle_auth_error(result: dict[str, Any]) -> None:
 def api_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     url = f"{get_api_url()}{path}"
     try:
-        resp = requests.get(url, headers=get_headers(), params=params, timeout=20)
+        resp = requests.get(url, headers=get_headers(), params=params, timeout=REQUEST_TIMEOUT)
         result = {
             "ok": resp.ok,
             "status_code": resp.status_code,
@@ -114,7 +115,7 @@ def api_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
 def api_post(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     url = f"{get_api_url()}{path}"
     try:
-        resp = requests.post(url, headers=get_headers(), json=payload or {}, timeout=20)
+        resp = requests.post(url, headers=get_headers(), json=payload or {}, timeout=REQUEST_TIMEOUT)
         result = {
             "ok": resp.ok,
             "status_code": resp.status_code,
@@ -207,7 +208,8 @@ def show_overview_metrics(summary: dict[str, Any]) -> None:
 
 
 def login_user(username: str, password: str) -> None:
-    result = request_login(get_api_url(), username, password)
+    with st.spinner("Signing in and waking the backend if needed..."):
+        result = request_login(get_api_url(), username, password, timeout=REQUEST_TIMEOUT)
     data = result.get("data", {})
     if result.get("ok") and isinstance(data, dict) and "access_token" in data:
         st.session_state.token = data["access_token"]
@@ -240,7 +242,7 @@ def render_login_gate() -> None:
     with right:
         st.subheader("Demo credentials")
         st.code(DEMO_CREDENTIALS)
-        st.info("If the backend is cold-starting on Render, the first login may take a little longer.")
+        st.info("If the backend is cold-starting on Render, the first login may take up to about a minute.")
 
     st.stop()
 

@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 from typing import Any, Dict, List
+from urllib.parse import urlparse
 
 import pandas as pd
 import pydeck as pdk
@@ -63,14 +64,25 @@ TN_MAP_VIEW_STATE = pdk.ViewState(latitude=10.85, longitude=78.62, zoom=6.35, pi
 def resolve_api_url() -> str:
     env_api_url = os.getenv("API_URL", "").strip()
     if env_api_url:
-        return env_api_url
+        return normalize_api_url(env_api_url)
 
     try:
         secrets_api_url = str(st.secrets.get("API_URL", "")).strip()
     except Exception:
         secrets_api_url = ""
 
-    return secrets_api_url or "http://localhost:8000"
+    return normalize_api_url(secrets_api_url or "http://localhost:8000")
+
+
+def normalize_api_url(value: str) -> str:
+    normalized = value.strip().rstrip("/")
+    if not normalized:
+        return normalized
+    parsed = urlparse(normalized)
+    if parsed.scheme:
+        return normalized
+    # Render private-network service references are exposed as host:port.
+    return f"http://{normalized}"
 
 
 def get_api_url() -> str:

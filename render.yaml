@@ -11,3 +11,15 @@ services:
         value: sqlite:///./tn_police_final.db
       - key: JWT_SECRET
         generateValue: true
+  - type: web
+    name: tn-police-ui
+    runtime: python
+    plan: free
+    buildCommand: pip install -r frontend/requirements.txt
+    startCommand: streamlit run frontend/frontend_app.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: API_URL
+        fromService:
+          type: web
+          name: tn-police-api
+          property: hostport

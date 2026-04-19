@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 from html import escape
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -31,6 +33,43 @@ DEMO_CREDENTIALS = (
 DEFAULT_DISTRICT_SCOPE = "Statewide"
 NO_CASE_LABEL = "No case focus"
 REQUEST_TIMEOUT = 75
+APP_DIR = Path(__file__).resolve().parent
+DISTRICT_COORDS_PATH = APP_DIR.parent / "data" / "tn_district_coordinates.csv"
+STATION_MASTER_PATH = APP_DIR.parent / "data" / "station_master_seed.csv"
+TN_STATE_OUTLINE = [
+    (76.17, 12.18),
+    (76.42, 12.55),
+    (76.82, 12.92),
+    (77.28, 13.17),
+    (77.92, 13.33),
+    (78.62, 13.39),
+    (79.21, 13.35),
+    (79.78, 13.25),
+    (80.25, 13.12),
+    (80.43, 12.78),
+    (80.46, 12.36),
+    (80.36, 11.89),
+    (80.28, 11.42),
+    (80.18, 10.98),
+    (80.01, 10.55),
+    (79.82, 10.16),
+    (79.55, 9.74),
+    (79.20, 9.39),
+    (78.84, 9.20),
+    (78.35, 9.00),
+    (77.96, 8.86),
+    (77.63, 8.56),
+    (77.40, 8.22),
+    (77.14, 8.08),
+    (76.95, 8.36),
+    (76.85, 8.79),
+    (76.78, 9.31),
+    (76.72, 9.86),
+    (76.67, 10.34),
+    (76.51, 10.82),
+    (76.31, 11.23),
+    (76.18, 11.72),
+]
 
 
 def apply_theme() -> None:
@@ -317,6 +356,159 @@ def to_optional_int(value: str) -> int | None:
         return None
 
 
+def clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def interpolate_color(start: tuple[int, int, int], end: tuple[int, int, int], ratio: float) -> str:
+    safe_ratio = clamp(ratio, 0.0, 1.0)
+    red = round(start[0] + (end[0] - start[0]) * safe_ratio)
+    green = round(start[1] + (end[1] - start[1]) * safe_ratio)
+    blue = round(start[2] + (end[2] - start[2]) * safe_ratio)
+    return f"rgb({red}, {green}, {blue})"
+
+
+def load_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def load_district_reference_rows() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in load_csv_rows(DISTRICT_COORDS_PATH):
+        rows.append(
+            {
+                "district": row.get("district"),
+                "latitude": to_float(row.get("latitude")),
+                "longitude": to_float(row.get("longitude")),
+            }
+        )
+    return rows
+
+
+def load_station_reference_rows() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in load_csv_rows(STATION_MASTER_PATH):
+        rows.append(
+            {
+                "district": row.get("district"),
+                "station_name": row.get("station_name"),
+                "station_type": row.get("station_type"),
+                "latitude": to_float(row.get("latitude")),
+                "longitude": to_float(row.get("longitude")),
+            }
+        )
+    return rows
+
+
+def project_geo_point(
+    longitude: float,
+    latitude: float,
+    min_lon: float,
+    max_lon: float,
+    min_lat: float,
+    max_lat: float,
+    width: int,
+    height: int,
+    padding: int,
+) -> tuple[float, float]:
+    usable_width = width - (padding * 2)
+    usable_height = height - (padding * 2)
+    x = padding + ((longitude - min_lon) / max(max_lon - min_lon, 0.0001)) * usable_width
+    y = height - padding - ((latitude - min_lat) / max(max_lat - min_lat, 0.0001)) * usable_height
+    return x, y
+
+
+def build_geo_svg(
+    title: str,
+    subtitle: str,
+    points: list[dict[str, Any]],
+    point_label_key: str,
+    selected_label: str | None = None,
+    intensity_key: str = "intensity",
+    value_key: str = "incident_count",
+    height: int = 760,
+) -> str:
+    width = 980
+    padding = 70
+    if not points:
+        return (
+            '<div class="tn-inline-note">'
+            f"{escape(title)} data is not available for the current selection."
+            "</div>"
+        )
+
+    all_lons = [coord[0] for coord in TN_STATE_OUTLINE] + [to_float(row.get("longitude")) for row in points]
+    all_lats = [coord[1] for coord in TN_STATE_OUTLINE] + [to_float(row.get("latitude")) for row in points]
+    min_lon, max_lon = min(all_lons), max(all_lons)
+    min_lat, max_lat = min(all_lats), max(all_lats)
+
+    outline_points = []
+    for lon, lat in TN_STATE_OUTLINE:
+        x, y = project_geo_point(lon, lat, min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        outline_points.append(f"{x:.1f},{y:.1f}")
+    outline_markup = " ".join(outline_points)
+
+    max_intensity = max((to_float(row.get(intensity_key)) for row in points), default=0.0)
+    max_intensity = max(max_intensity, 1.0)
+
+    point_markup: list[str] = []
+    for index, row in enumerate(points):
+        label = str(row.get(point_label_key) or "Unknown")
+        latitude = to_float(row.get("latitude"))
+        longitude = to_float(row.get("longitude"))
+        x, y = project_geo_point(longitude, latitude, min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        intensity = to_float(row.get(intensity_key))
+        ratio = intensity / max_intensity
+        radius = 8 + (ratio * 16)
+        fill = interpolate_color((71, 122, 199), (255, 140, 66), ratio)
+        stroke = "#ffe2bf" if selected_label and label == selected_label else "#d8e6ff"
+        stroke_width = 4 if selected_label and label == selected_label else 1.6
+        label_y = y - radius - (15 if index % 2 else 7)
+        metric_value = row.get(value_key, row.get(intensity_key, 0))
+        tooltip_lines = [
+            label,
+            f"Intensity: {row.get(intensity_key, 0)}",
+            f"Metric: {metric_value}",
+        ]
+        if row.get("avg_anomaly") not in (None, "", "N/A"):
+            tooltip_lines.append(f"Avg anomaly: {row.get('avg_anomaly')}")
+        tooltip = " | ".join(str(item) for item in tooltip_lines)
+        point_markup.append(
+            f"""
+            <g>
+                <circle cx="{x:.1f}" cy="{y:.1f}" r="{radius:.1f}" fill="{fill}" fill-opacity="0.88"
+                    stroke="{stroke}" stroke-width="{stroke_width}">
+                    <title>{escape(tooltip)}</title>
+                </circle>
+                <text x="{x:.1f}" y="{label_y:.1f}" text-anchor="middle"
+                    style="fill:#eaf2ff;font-size:11px;font-family:system-ui,sans-serif;font-weight:600;">
+                    {escape(label)}
+                </text>
+            </g>
+            """
+        )
+
+    return f"""
+    <div style="border:1px solid rgba(92,116,151,0.35);border-radius:24px;padding:1rem 1rem 0.7rem 1rem;
+        background:linear-gradient(180deg, rgba(15,25,40,0.98), rgba(10,18,28,0.96));">
+        <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:1rem;flex-wrap:wrap;">
+            <div>
+                <div style="color:#76b7ff;font-size:0.82rem;letter-spacing:0.12em;text-transform:uppercase;font-weight:700;">{escape(title)}</div>
+                <div style="color:#97a8c4;font-size:0.95rem;margin-top:0.25rem;">{escape(subtitle)}</div>
+            </div>
+            <div style="color:#97a8c4;font-size:0.82rem;">Hover points for district or station detail.</div>
+        </div>
+        <svg viewBox="0 0 {width} {height}" style="width:100%;height:auto;margin-top:0.8rem;">
+            <polygon points="{outline_markup}" fill="rgba(118,183,255,0.06)"
+                stroke="rgba(118,183,255,0.45)" stroke-width="3" />
+            {"".join(point_markup)}
+        </svg>
+    </div>
+    """
+
 def scalarize(value: Any) -> Any:
     if value is None:
         return "N/A"
@@ -354,6 +546,60 @@ def clean_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def rows_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
     return clean_rows(payload_to_rows(result.get("data")))
+
+
+def build_district_map_rows(
+    heatmap_rows: list[dict[str, Any]],
+    selected_district: str | None = None,
+) -> list[dict[str, Any]]:
+    heatmap_lookup = {str(row.get("district")): row for row in heatmap_rows if row.get("district")}
+    combined_rows: list[dict[str, Any]] = []
+    for row in load_district_reference_rows():
+        district = str(row.get("district") or "")
+        metric_row = heatmap_lookup.get(district, {})
+        combined_rows.append(
+            {
+                "district": district,
+                "latitude": row.get("latitude"),
+                "longitude": row.get("longitude"),
+                "incident_count": to_int(metric_row.get("incident_count")),
+                "avg_anomaly": to_float(metric_row.get("avg_anomaly")),
+                "intensity": round(to_float(metric_row.get("intensity")), 2),
+                "selected": district == selected_district,
+            }
+        )
+    return combined_rows
+
+
+def build_station_map_rows(
+    station_heatmap_rows: list[dict[str, Any]],
+    district_scope: str,
+) -> list[dict[str, Any]]:
+    heatmap_lookup = {
+        (str(row.get("district")), str(row.get("station_name"))): row
+        for row in station_heatmap_rows
+        if row.get("station_name")
+    }
+    combined_rows: list[dict[str, Any]] = []
+    for row in load_station_reference_rows():
+        district = str(row.get("district") or "")
+        if district_scope != DEFAULT_DISTRICT_SCOPE and district != district_scope:
+            continue
+        station_name = str(row.get("station_name") or "")
+        metric_row = heatmap_lookup.get((district, station_name), {})
+        combined_rows.append(
+            {
+                "district": district,
+                "station_name": station_name,
+                "station_type": row.get("station_type"),
+                "latitude": row.get("latitude"),
+                "longitude": row.get("longitude"),
+                "incident_count": to_int(metric_row.get("incident_count")),
+                "avg_anomaly": to_float(metric_row.get("avg_anomaly")),
+                "intensity": round(to_float(metric_row.get("intensity")), 2),
+            }
+        )
+    return combined_rows
 
 
 def render_result_error(result: dict[str, Any], title: str) -> None:
@@ -727,6 +973,159 @@ def render_mission_control(district_scope: str, current_role: str) -> None:
         caption="Queued and in-progress operational tasks surfaced from the command center.",
         limit=8,
     )
+
+
+def render_geo_command(district_scope: str) -> None:
+    render_hero(
+        "Geo Command",
+        "Statewide Tamil Nadu district visibility with district-level intensity, station disposition, incident filtering, and geofence review.",
+        eyebrow="Statewide Geospatial Intelligence",
+        chips=[
+            "Visible to every logged-in role",
+            "Tamil Nadu district lens",
+            "District and station overlays",
+        ],
+    )
+    render_inline_note(
+        "Statewide district visibility is available to all authenticated users. Use the district detail lens to inspect station concentration and current operational activity."
+    )
+
+    control_left, control_mid, control_right = st.columns([1.1, 0.9, 1.0])
+    with control_left:
+        category_filter = st.text_input("Incident category filter", key="geo_category_filter")
+    with control_mid:
+        source_type = st.selectbox("Source type", ["all", "synthetic_demo", "public"], index=0, key="geo_source_type")
+    with control_right:
+        min_anomaly = st.slider("Minimum anomaly", 0.0, 1.0, 0.0, 0.05, key="geo_min_anomaly")
+
+    heatmap_params = compact_params(
+        {
+            "category": category_filter or None,
+            "source_type": None if source_type == "all" else source_type,
+            "min_anomaly": min_anomaly,
+        }
+    )
+
+    district_heatmap_result = api_get("/geo/district-heatmap", params=heatmap_params or None)
+    district_heatmap_rows = rows_from_result(district_heatmap_result)
+    district_map_rows = build_district_map_rows(district_heatmap_rows)
+
+    available_districts = [str(row.get("district")) for row in district_map_rows if row.get("district")]
+    if district_scope != DEFAULT_DISTRICT_SCOPE and district_scope in available_districts:
+        detail_district = district_scope
+        st.caption(f"District detail is pinned to `{district_scope}` by your current workspace scope.")
+    else:
+        default_district = None
+        if district_heatmap_rows:
+            top_row = max(district_heatmap_rows, key=lambda row: to_float(row.get("intensity")))
+            default_district = str(top_row.get("district") or "")
+        if not default_district and available_districts:
+            default_district = available_districts[0]
+        detail_district = st.selectbox(
+            "District detail lens",
+            available_districts,
+            index=available_districts.index(default_district) if default_district in available_districts else 0,
+            key="geo_detail_district",
+        ) if available_districts else None
+
+    station_heatmap_result = api_get(
+        "/geo/station-heatmap",
+        params=compact_params({**heatmap_params, "district": detail_district}) or None,
+    )
+    station_heatmap_rows = rows_from_result(station_heatmap_result)
+    station_map_rows = build_station_map_rows(station_heatmap_rows, detail_district or district_scope)
+
+    incidents_result = api_get(
+        "/incidents",
+        params=compact_params({**heatmap_params, "district": detail_district}) or None,
+    )
+    incident_rows = rows_from_result(incidents_result)
+    geofence_result = api_get(
+        "/geo/geofence-alerts",
+        params=compact_params({"district": detail_district}) or None,
+    )
+    geofence_rows = rows_from_result(geofence_result)
+
+    selected_district_map_rows = build_district_map_rows(district_heatmap_rows, selected_district=detail_district)
+    total_incidents = sum(to_int(row.get("incident_count")) for row in district_map_rows)
+    max_intensity = max((to_float(row.get("intensity")) for row in district_map_rows), default=0.0)
+    active_geofences = sum(1 for row in geofence_rows if str(row.get("active")).lower() == "yes")
+    render_metric_grid(
+        [
+            ("Districts Mapped", len(district_map_rows)),
+            ("District Incidents", total_incidents),
+            ("Peak District Intensity", round(max_intensity, 2)),
+            ("Detail District", detail_district or "N/A"),
+            ("Stations Visible", len(station_map_rows)),
+            ("Filtered Incidents", len(incident_rows)),
+            ("Geofence Alerts", len(geofence_rows)),
+            ("Active Geofences", active_geofences),
+        ]
+    )
+
+    map_left, map_right = st.columns([1.2, 0.8])
+    with map_left:
+        st.markdown(
+            build_geo_svg(
+                "Tamil Nadu District Situation Map",
+                "Every district is visible here, with intensity driven by incident volume, severity, and anomaly score.",
+                selected_district_map_rows,
+                point_label_key="district",
+                selected_label=detail_district,
+                intensity_key="intensity",
+                value_key="incident_count",
+            ),
+            unsafe_allow_html=True,
+        )
+    with map_right:
+        station_subtitle = (
+            f"Station view for {detail_district}."
+            if detail_district
+            else "Select a district to inspect station-level disposition."
+        )
+        if station_map_rows:
+            st.markdown(
+                build_geo_svg(
+                    "District Station Disposition",
+                    station_subtitle,
+                    station_map_rows,
+                    point_label_key="station_name",
+                    intensity_key="intensity",
+                    value_key="incident_count",
+                    height=700,
+                ),
+                unsafe_allow_html=True,
+            )
+        else:
+            render_inline_note("Station map data is not available for the current detail district.")
+
+    lower_left, lower_right = st.columns(2)
+    with lower_left:
+        render_table(
+            "District Intensity Table",
+            sorted(district_map_rows, key=lambda row: to_float(row.get("intensity")), reverse=True),
+            caption="All Tamil Nadu districts ranked by current operational intensity.",
+            limit=38,
+        )
+        render_table(
+            "Station Disposition",
+            sorted(station_map_rows, key=lambda row: to_float(row.get("intensity")), reverse=True),
+            caption="Station-level incident and anomaly signal inside the selected district lens.",
+            limit=20,
+        )
+    with lower_right:
+        render_table(
+            "Recent Incidents",
+            incident_rows,
+            caption="Filtered incidents for the current detail district and analytic filter set.",
+            limit=20,
+        )
+        render_table(
+            "Geofence Alerts",
+            geofence_rows,
+            caption="Configured geofence zones and threshold states for the detail district.",
+            limit=16,
+        )
 
 
 def render_fusion_center(district_scope: str, selected_case_id: int | None) -> None:
@@ -1694,6 +2093,7 @@ with st.sidebar:
         "Workspace",
         [
             "Mission Control",
+            "Geo Command",
             "Fusion Center",
             "Case Dossier",
             "District Command",
@@ -1711,6 +2111,8 @@ render_global_header(me_payload, dashboard_summary, district_scope, selected_cas
 
 if workspace == "Mission Control":
     render_mission_control(district_scope, current_role)
+elif workspace == "Geo Command":
+    render_geo_command(district_scope)
 elif workspace == "Fusion Center":
     render_fusion_center(district_scope, selected_case_id)
 elif workspace == "Case Dossier":

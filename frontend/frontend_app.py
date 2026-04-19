@@ -523,7 +523,7 @@ def render_login_gate() -> None:
         "TN Police Intelligence Platform",
         "Analyst-grade operational workspace for command, fusion, dossier, judicial, and export flows.",
         eyebrow="Secure Analyst Access",
-        chips=["FastAPI backend", "Streamlit console", "Cold-start tolerant login"],
+        chips=["Secure sign-in", "Unified command workspace"],
     )
 
     left, right = st.columns([1.05, 0.95])
@@ -532,7 +532,7 @@ def render_login_gate() -> None:
         username = st.text_input("Username", value="admin_tn", key="login_username")
         password = st.text_input("Password", type="password", value="admin123", key="login_password")
         if st.button("Sign In", use_container_width=True, key="login_submit"):
-            with st.spinner("Signing in and waking the backend if needed..."):
+            with st.spinner("Establishing secure session..."):
                 result = request_login(get_api_url(), username, password, timeout=REQUEST_TIMEOUT)
             data = result.get("data", {})
             if result.get("ok") and isinstance(data, dict) and "access_token" in data:
@@ -552,7 +552,7 @@ def render_login_gate() -> None:
     with right:
         st.markdown("### Demo Credentials")
         st.code(DEMO_CREDENTIALS)
-        render_inline_note("Render free-tier cold starts can make the first sign-in take close to a minute.")
+        render_inline_note("Initial sign-in may take up to a minute while platform services initialize.")
 
     st.stop()
 
@@ -570,7 +570,6 @@ def render_global_header(
         f"User: {st.session_state.get('username', 'unknown')}",
         f"District scope: {district_scope}",
         f"Case focus: {selected_case_id if selected_case_id is not None else 'none'}",
-        f"API: {get_api_url()}",
     ]
     render_hero(
         "TN Police Intelligence Platform",
@@ -1658,11 +1657,6 @@ def render_explorer() -> None:
 
 
 with st.sidebar:
-    st.markdown("### API URL")
-    api_url_input = st.text_input("API URL", value=get_api_url(), label_visibility="collapsed")
-    st.session_state.api_url = normalize_api_url(api_url_input)
-
-    st.divider()
     st.caption("Demo credentials")
     st.code(DEMO_CREDENTIALS)
 

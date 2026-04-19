@@ -1,4 +1,2 @@
-streamlit==1.55.0
+streamlit>=1.55,<1.56
 requests==2.32.3
-pandas>=3.0,<3.1
-pydeck==0.9.1

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import csv
 import json
 import os
@@ -10,6 +11,7 @@ from urllib.parse import urlparse
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     from auth_client import request_login
@@ -193,6 +195,28 @@ def apply_theme() -> None:
             border-radius: 0 16px 16px 0;
             padding: 0.95rem 1rem;
             margin-bottom: 0.8rem;
+        }
+
+        .tn-message-card {
+            border: 1px solid var(--tn-line);
+            border-radius: 18px;
+            padding: 0.9rem 1rem;
+            margin-bottom: 0.8rem;
+            background: linear-gradient(180deg, rgba(17, 26, 39, 0.92), rgba(10, 17, 28, 0.94));
+        }
+
+        .tn-message-meta {
+            color: var(--tn-muted);
+            font-size: 0.84rem;
+            margin-bottom: 0.45rem;
+        }
+
+        .tn-message-priority {
+            color: var(--tn-accent);
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            font-size: 0.74rem;
         }
         </style>
         """,
@@ -430,6 +454,9 @@ def build_geo_svg(
     intensity_key: str = "intensity",
     value_key: str = "incident_count",
     height: int = 760,
+    coverage_key: str | None = None,
+    label_stride: int = 1,
+    show_labels: bool = True,
 ) -> str:
     width = 980
     padding = 70
@@ -468,25 +495,41 @@ def build_geo_svg(
         stroke_width = 4 if selected_label and label == selected_label else 1.6
         label_y = y - radius - (15 if index % 2 else 7)
         metric_value = row.get(value_key, row.get(intensity_key, 0))
+        coverage_value = to_float(row.get(coverage_key)) if coverage_key else 0.0
         tooltip_lines = [
             label,
             f"Intensity: {row.get(intensity_key, 0)}",
             f"Metric: {metric_value}",
         ]
+        if coverage_key:
+            tooltip_lines.append(f"{coverage_key.replace('_', ' ').title()}: {row.get(coverage_key, 0)}")
         if row.get("avg_anomaly") not in (None, "", "N/A"):
             tooltip_lines.append(f"Avg anomaly: {row.get('avg_anomaly')}")
         tooltip = " | ".join(str(item) for item in tooltip_lines)
+        coverage_markup = ""
+        if coverage_key:
+            coverage_radius = radius + min(coverage_value * 2.4, 42)
+            coverage_markup = (
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{coverage_radius:.1f}" '
+                'fill="rgba(255, 140, 66, 0.08)" stroke="rgba(255, 140, 66, 0.22)" '
+                'stroke-width="1.1" stroke-dasharray="6 4"></circle>'
+            )
+        label_markup = ""
+        if show_labels and (label_stride <= 1 or index % label_stride == 0 or label == selected_label):
+            label_markup = (
+                f'<text x="{x:.1f}" y="{label_y:.1f}" text-anchor="middle" '
+                'style="fill:#eaf2ff;font-size:11px;font-family:system-ui,sans-serif;font-weight:600;">'
+                f"{escape(label)}</text>"
+            )
         point_markup.append(
             f"""
             <g>
+                {coverage_markup}
                 <circle cx="{x:.1f}" cy="{y:.1f}" r="{radius:.1f}" fill="{fill}" fill-opacity="0.88"
                     stroke="{stroke}" stroke-width="{stroke_width}">
                     <title>{escape(tooltip)}</title>
                 </circle>
-                <text x="{x:.1f}" y="{label_y:.1f}" text-anchor="middle"
-                    style="fill:#eaf2ff;font-size:11px;font-family:system-ui,sans-serif;font-weight:600;">
-                    {escape(label)}
-                </text>
+                {label_markup}
             </g>
             """
         )
@@ -508,6 +551,13 @@ def build_geo_svg(
         </svg>
     </div>
     """
+
+
+def render_geo_html(markup: str, height: int) -> None:
+    if markup.strip().startswith('<div class="tn-inline-note">'):
+        st.markdown(markup, unsafe_allow_html=True)
+        return
+    components.html(markup, height=height, scrolling=False)
 
 def scalarize(value: Any) -> Any:
     if value is None:
@@ -589,6 +639,7 @@ def build_station_map_rows(
         metric_row = heatmap_lookup.get((district, station_name), {})
         combined_rows.append(
             {
+                "station_id": to_optional_int(str(metric_row.get("station_id", ""))),
                 "district": district,
                 "station_name": station_name,
                 "station_type": row.get("station_type"),
@@ -600,6 +651,192 @@ def build_station_map_rows(
             }
         )
     return combined_rows
+
+
+def build_cctv_district_rows(
+    district_map_rows: list[dict[str, Any]],
+    geofence_rows: list[dict[str, Any]],
+    hotspot_rows: list[dict[str, Any]],
+    patrol_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    geofence_counts: dict[str, int] = defaultdict(int)
+    hotspot_counts: dict[str, int] = defaultdict(int)
+    patrol_gap_counts: dict[str, int] = defaultdict(int)
+
+    for row in geofence_rows:
+        district = str(row.get("district") or "")
+        if district:
+            geofence_counts[district] += 1
+    for row in hotspot_rows:
+        district = str(row.get("district") or "")
+        if district:
+            hotspot_counts[district] += 1
+    for row in patrol_rows:
+        district = str(row.get("district") or "")
+        if district and to_float(row.get("coverage_ratio"), 1.0) < 0.7:
+            patrol_gap_counts[district] += 1
+
+    output: list[dict[str, Any]] = []
+    for row in district_map_rows:
+        district = str(row.get("district") or "")
+        incident_count = to_int(row.get("incident_count"))
+        intensity = to_float(row.get("intensity"))
+        avg_anomaly = to_float(row.get("avg_anomaly"))
+        geofence_count = geofence_counts.get(district, 0)
+        hotspot_count = hotspot_counts.get(district, 0)
+        patrol_gap_count = patrol_gap_counts.get(district, 0)
+        surveillance_score = round(
+            (intensity * 1.45)
+            + (incident_count * 0.22)
+            + (avg_anomaly * 8.5)
+            + (geofence_count * 2.4)
+            + (hotspot_count * 1.8)
+            + (patrol_gap_count * 1.6),
+            2,
+        )
+        recommended_cameras = max(
+            8,
+            round((incident_count * 0.55) + (intensity * 1.25) + (hotspot_count * 4.2) + (patrol_gap_count * 3.4)),
+        )
+        ptz_units = max(2, round(recommended_cameras * 0.22))
+        fixed_dome_units = max(3, round(recommended_cameras * 0.43))
+        anpr_units = max(1, round(recommended_cameras * 0.18))
+        mobile_towers = max(0, round((geofence_count + hotspot_count) * 0.6))
+        posture = "Immediate dense coverage"
+        if surveillance_score < 18:
+            posture = "Preventive monitoring"
+        elif surveillance_score < 30:
+            posture = "Targeted reinforcement"
+        output.append(
+            {
+                "district": district,
+                "latitude": row.get("latitude"),
+                "longitude": row.get("longitude"),
+                "incident_count": incident_count,
+                "avg_anomaly": round(avg_anomaly, 2),
+                "intensity": round(intensity, 2),
+                "geofence_zones": geofence_count,
+                "forecast_hotspots": hotspot_count,
+                "patrol_gaps": patrol_gap_count,
+                "surveillance_score": surveillance_score,
+                "recommended_cameras": recommended_cameras,
+                "ptz_units": ptz_units,
+                "fixed_dome_units": fixed_dome_units,
+                "anpr_units": anpr_units,
+                "mobile_towers": mobile_towers,
+                "retention_profile": "90 days" if surveillance_score >= 30 else "60 days" if surveillance_score >= 18 else "30 days",
+                "deployment_posture": posture,
+            }
+        )
+    return sorted(output, key=lambda item: to_float(item.get("surveillance_score")), reverse=True)
+
+
+def build_cctv_station_rows(station_map_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for row in station_map_rows:
+        station_type = str(row.get("station_type") or "Police Station")
+        incident_count = to_int(row.get("incident_count"))
+        intensity = to_float(row.get("intensity"))
+        avg_anomaly = to_float(row.get("avg_anomaly"))
+        coverage_circle_km = round(1.2 + (intensity * 0.08) + (incident_count * 0.03) + (0.9 if station_type == "Central" else 0.7), 2)
+        recommended_cameras = max(3, round((incident_count * 0.85) + (intensity * 0.6) + (3 if station_type == "Central" else 2)))
+        output.append(
+            {
+                "district": row.get("district"),
+                "station_name": row.get("station_name"),
+                "station_type": station_type,
+                "latitude": row.get("latitude"),
+                "longitude": row.get("longitude"),
+                "incident_count": incident_count,
+                "avg_anomaly": round(avg_anomaly, 2),
+                "intensity": round(intensity, 2),
+                "coverage_circle_km": coverage_circle_km,
+                "recommended_cameras": recommended_cameras,
+                "camera_profile": "PTZ + Dome grid" if station_type == "Central" else "Cyber ingress + ANPR",
+                "blind_spot_risk": "High" if intensity >= 8 or avg_anomaly >= 0.7 else "Moderate" if intensity >= 4 else "Low",
+                "watch_posture": "Junction saturation" if station_type == "Central" else "Digital corridor watch",
+            }
+        )
+    return sorted(output, key=lambda item: (to_float(item.get("intensity")), to_int(item.get("incident_count"))), reverse=True)
+
+
+def build_police_circle_rows(station_map_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for row in station_map_rows:
+        intensity = to_float(row.get("intensity"))
+        incident_count = to_int(row.get("incident_count"))
+        station_type = str(row.get("station_type") or "Police Station")
+        lookout_radius_km = round(1.5 + (intensity * 0.11) + (incident_count * 0.04) + (1.0 if station_type == "Central" else 0.8), 2)
+        output.append(
+            {
+                "district": row.get("district"),
+                "station_name": row.get("station_name"),
+                "station_type": station_type,
+                "latitude": row.get("latitude"),
+                "longitude": row.get("longitude"),
+                "intensity": round(intensity, 2),
+                "incident_count": incident_count,
+                "lookout_radius_km": lookout_radius_km,
+                "circle_priority": "Red" if intensity >= 8 else "Amber" if intensity >= 4 else "Blue",
+                "lookout_focus": "Road and junction interception" if station_type == "Central" else "Fraud and digital evidence watch",
+            }
+        )
+    return sorted(output, key=lambda item: to_float(item.get("lookout_radius_km")), reverse=True)
+
+
+def summarize_comms_rooms(message_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in message_rows:
+        room_name = str(row.get("room_name") or "Unassigned")
+        slot = grouped.setdefault(
+            room_name,
+            {
+                "room_name": room_name,
+                "channel_scope": row.get("channel_scope"),
+                "district": row.get("district"),
+                "messages": 0,
+                "priority_messages": 0,
+                "latest_sender": row.get("sender_username"),
+                "latest_activity": row.get("created_at"),
+            },
+        )
+        slot["messages"] += 1
+        if str(row.get("priority")).lower() in {"high", "critical"}:
+            slot["priority_messages"] += 1
+        if str(row.get("created_at")) > str(slot.get("latest_activity")):
+            slot["latest_sender"] = row.get("sender_username")
+            slot["latest_activity"] = row.get("created_at")
+    return sorted(grouped.values(), key=lambda item: str(item.get("latest_activity")), reverse=True)
+
+
+def render_message_feed(rows: list[dict[str, Any]], empty_message: str = "No coordination traffic available.") -> None:
+    if not rows:
+        st.caption(empty_message)
+        return
+
+    for row in rows:
+        priority = str(row.get("priority") or "routine")
+        recipient = row.get("recipient_username") or row.get("room_name") or "broadcast"
+        meta = " | ".join(
+            part for part in [
+                f"{row.get('sender_username', 'unknown')} -> {recipient}",
+                str(row.get("channel_scope") or "statewide"),
+                str(row.get("district") or "statewide"),
+                str(row.get("created_at") or "n/a"),
+            ]
+            if part
+        )
+        body = escape(str(row.get("message_text") or ""))
+        st.markdown(
+            f"""
+            <div class="tn-message-card">
+                <div class="tn-message-priority">{escape(priority)}</div>
+                <div class="tn-message-meta">{escape(meta)}</div>
+                <div>{body}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 def render_result_error(result: dict[str, Any], title: str) -> None:
@@ -978,16 +1215,16 @@ def render_mission_control(district_scope: str, current_role: str) -> None:
 def render_geo_command(district_scope: str) -> None:
     render_hero(
         "Geo Command",
-        "Statewide Tamil Nadu district visibility with district-level intensity, station disposition, incident filtering, and geofence review.",
+        "Statewide Tamil Nadu district visibility, CCTV deployment planning, and police-station lookout circles aligned in one geospatial command surface.",
         eyebrow="Statewide Geospatial Intelligence",
         chips=[
             "Visible to every logged-in role",
-            "Tamil Nadu district lens",
-            "District and station overlays",
+            "All 38 Tamil Nadu districts",
+            "CCTV and station-circle overlays",
         ],
     )
     render_inline_note(
-        "Statewide district visibility is available to all authenticated users. Use the district detail lens to inspect station concentration and current operational activity."
+        "Statewide district visibility is available to all authenticated users. Use the district detail lens to inspect station concentration, CCTV reinforcement options, and police-station lookout circles."
     )
 
     control_left, control_mid, control_right = st.columns([1.1, 0.9, 1.0])
@@ -1009,6 +1246,9 @@ def render_geo_command(district_scope: str) -> None:
     district_heatmap_result = api_get("/geo/district-heatmap", params=heatmap_params or None)
     district_heatmap_rows = rows_from_result(district_heatmap_result)
     district_map_rows = build_district_map_rows(district_heatmap_rows)
+    statewide_station_heatmap_result = api_get("/geo/station-heatmap", params=heatmap_params or None)
+    statewide_station_heatmap_rows = rows_from_result(statewide_station_heatmap_result)
+    statewide_station_map_rows = build_station_map_rows(statewide_station_heatmap_rows, DEFAULT_DISTRICT_SCOPE)
 
     available_districts = [str(row.get("district")) for row in district_map_rows if row.get("district")]
     if district_scope != DEFAULT_DISTRICT_SCOPE and district_scope in available_districts:
@@ -1040,21 +1280,42 @@ def render_geo_command(district_scope: str) -> None:
         params=compact_params({**heatmap_params, "district": detail_district}) or None,
     )
     incident_rows = rows_from_result(incidents_result)
+    statewide_geofence_rows = rows_from_result(api_get("/geo/geofence-alerts"))
     geofence_result = api_get(
         "/geo/geofence-alerts",
         params=compact_params({"district": detail_district}) or None,
     )
     geofence_rows = rows_from_result(geofence_result)
+    statewide_hotspot_rows = rows_from_result(api_get("/hotspot-forecasts"))
+    statewide_patrol_rows = rows_from_result(api_get("/patrol-coverage"))
+    detail_hotspot_rows = rows_from_result(
+        api_get("/hotspot-forecasts", params=compact_params({"district": detail_district}) or None)
+    )
+    detail_patrol_rows = rows_from_result(
+        api_get("/patrol-coverage", params=compact_params({"district": detail_district}) or None)
+    )
 
     selected_district_map_rows = build_district_map_rows(district_heatmap_rows, selected_district=detail_district)
+    cctv_district_rows = build_cctv_district_rows(
+        district_map_rows,
+        statewide_geofence_rows,
+        statewide_hotspot_rows,
+        statewide_patrol_rows,
+    )
+    cctv_station_rows = build_cctv_station_rows(station_map_rows)
+    statewide_circle_rows = build_police_circle_rows(statewide_station_map_rows)
+    detail_circle_rows = build_police_circle_rows(station_map_rows)
     total_incidents = sum(to_int(row.get("incident_count")) for row in district_map_rows)
     max_intensity = max((to_float(row.get("intensity")) for row in district_map_rows), default=0.0)
     active_geofences = sum(1 for row in geofence_rows if str(row.get("active")).lower() == "yes")
+    total_recommended_cameras = sum(to_int(row.get("recommended_cameras")) for row in cctv_district_rows)
     render_metric_grid(
         [
             ("Districts Mapped", len(district_map_rows)),
+            ("Police Station Circles", len(statewide_circle_rows)),
             ("District Incidents", total_incidents),
             ("Peak District Intensity", round(max_intensity, 2)),
+            ("Recommended CCTV Units", total_recommended_cameras),
             ("Detail District", detail_district or "N/A"),
             ("Stations Visible", len(station_map_rows)),
             ("Filtered Incidents", len(incident_rows)),
@@ -1063,69 +1324,190 @@ def render_geo_command(district_scope: str) -> None:
         ]
     )
 
-    map_left, map_right = st.columns([1.2, 0.8])
-    with map_left:
-        st.markdown(
-            build_geo_svg(
-                "Tamil Nadu District Situation Map",
-                "Every district is visible here, with intensity driven by incident volume, severity, and anomaly score.",
-                selected_district_map_rows,
-                point_label_key="district",
-                selected_label=detail_district,
-                intensity_key="intensity",
-                value_key="incident_count",
-            ),
-            unsafe_allow_html=True,
-        )
-    with map_right:
-        station_subtitle = (
-            f"Station view for {detail_district}."
-            if detail_district
-            else "Select a district to inspect station-level disposition."
-        )
-        if station_map_rows:
-            st.markdown(
+    tabs = st.tabs(["Situation", "CCTV Coverage", "Police Circles"])
+    with tabs[0]:
+        map_left, map_right = st.columns([1.18, 0.82])
+        with map_left:
+            render_geo_html(
                 build_geo_svg(
-                    "District Station Disposition",
-                    station_subtitle,
-                    station_map_rows,
+                    "Tamil Nadu District Situation Map",
+                    "Every district is visible here, with intensity driven by incident volume, severity, and anomaly score.",
+                    selected_district_map_rows,
+                    point_label_key="district",
+                    selected_label=detail_district,
+                    intensity_key="intensity",
+                    value_key="incident_count",
+                ),
+                height=920,
+            )
+        with map_right:
+            station_subtitle = (
+                f"Station view for {detail_district}."
+                if detail_district
+                else "Select a district to inspect station-level disposition."
+            )
+            if station_map_rows:
+                render_geo_html(
+                    build_geo_svg(
+                        "District Station Disposition",
+                        station_subtitle,
+                        station_map_rows,
+                        point_label_key="station_name",
+                        intensity_key="intensity",
+                        value_key="incident_count",
+                        height=700,
+                    ),
+                    height=830,
+                )
+            else:
+                render_inline_note("Station map data is not available for the current detail district.")
+
+        lower_left, lower_right = st.columns(2)
+        with lower_left:
+            render_table(
+                "District Intensity Table",
+                sorted(district_map_rows, key=lambda row: to_float(row.get("intensity")), reverse=True),
+                caption="All Tamil Nadu districts ranked by current operational intensity.",
+                limit=38,
+            )
+            render_table(
+                "Station Disposition",
+                sorted(station_map_rows, key=lambda row: to_float(row.get("intensity")), reverse=True),
+                caption="Station-level incident and anomaly signal inside the selected district lens.",
+                limit=20,
+            )
+        with lower_right:
+            render_table(
+                "Recent Incidents",
+                incident_rows,
+                caption="Filtered incidents for the current detail district and analytic filter set.",
+                limit=20,
+            )
+            render_table(
+                "Geofence Alerts",
+                geofence_rows,
+                caption="Configured geofence zones and threshold states for the detail district.",
+                limit=16,
+            )
+            render_table(
+                "Hotspot Forecasts",
+                detail_hotspot_rows,
+                caption="Forecast zones requiring forward surveillance and patrol attention inside the detail district.",
+                limit=10,
+            )
+            render_table(
+                "Patrol Coverage Gaps",
+                detail_patrol_rows,
+                caption="Lowest-coverage beats and backlog pressure inside the detail district.",
+                limit=10,
+            )
+
+    with tabs[1]:
+        render_inline_note(
+            "CCTV planning is derived from district intensity, anomaly load, hotspot forecasts, geofence zones, and patrol gaps. These are deployment recommendations rather than claims of live camera access."
+        )
+        cctv_left, cctv_right = st.columns([1.14, 0.86])
+        with cctv_left:
+            render_geo_html(
+                build_geo_svg(
+                    "Statewide CCTV Prioritization Map",
+                    "Districts are sized by recommended CCTV reinforcement volume and colored by surveillance pressure.",
+                    cctv_district_rows,
+                    point_label_key="district",
+                    selected_label=detail_district,
+                    intensity_key="surveillance_score",
+                    value_key="recommended_cameras",
+                    coverage_key="recommended_cameras",
+                ),
+                height=920,
+            )
+        with cctv_right:
+            if cctv_station_rows:
+                render_geo_html(
+                    build_geo_svg(
+                        "District CCTV Package Map",
+                        f"Recommended camera package and coverage ring for {detail_district}.",
+                        cctv_station_rows,
+                        point_label_key="station_name",
+                        intensity_key="intensity",
+                        value_key="recommended_cameras",
+                        coverage_key="coverage_circle_km",
+                        height=700,
+                    ),
+                    height=830,
+                )
+            else:
+                render_inline_note("District CCTV package planning appears once station activity is available in the selected district.")
+
+        cctv_lower_left, cctv_lower_right = st.columns(2)
+        with cctv_lower_left:
+            render_table(
+                "Statewide CCTV Deployment Matrix",
+                cctv_district_rows,
+                caption="District-level CCTV reinforcement options across Tamil Nadu, including PTZ, dome, ANPR, and mobile tower recommendations.",
+                limit=38,
+            )
+        with cctv_lower_right:
+            render_table(
+                "District Camera Packages",
+                cctv_station_rows,
+                caption="Station-level packages for the selected district, including watch posture and blind-spot risk.",
+                limit=20,
+            )
+
+    with tabs[2]:
+        render_inline_note(
+            "Coverage circles represent lookout and response radii around police stations. They are operational watch zones, not exact legal jurisdiction boundaries."
+        )
+        circle_left, circle_right = st.columns([1.12, 0.88])
+        with circle_left:
+            render_geo_html(
+                build_geo_svg(
+                    "Tamil Nadu Police Station Coverage Circles",
+                    "Every seeded station is plotted statewide, with the outer ring indicating recommended lookout radius.",
+                    statewide_circle_rows,
                     point_label_key="station_name",
                     intensity_key="intensity",
                     value_key="incident_count",
-                    height=700,
+                    coverage_key="lookout_radius_km",
+                    height=760,
+                    label_stride=5,
                 ),
-                unsafe_allow_html=True,
+                height=900,
             )
-        else:
-            render_inline_note("Station map data is not available for the current detail district.")
+        with circle_right:
+            if detail_circle_rows:
+                render_geo_html(
+                    build_geo_svg(
+                        "District Lookout Circles",
+                        f"Coverage circles for the {detail_district} station network.",
+                        detail_circle_rows,
+                        point_label_key="station_name",
+                        intensity_key="intensity",
+                        value_key="incident_count",
+                        coverage_key="lookout_radius_km",
+                        height=700,
+                    ),
+                    height=830,
+                )
+            else:
+                render_inline_note("District lookout circles will appear when station-level reference data is available.")
 
-    lower_left, lower_right = st.columns(2)
-    with lower_left:
-        render_table(
-            "District Intensity Table",
-            sorted(district_map_rows, key=lambda row: to_float(row.get("intensity")), reverse=True),
-            caption="All Tamil Nadu districts ranked by current operational intensity.",
-            limit=38,
-        )
-        render_table(
-            "Station Disposition",
-            sorted(station_map_rows, key=lambda row: to_float(row.get("intensity")), reverse=True),
-            caption="Station-level incident and anomaly signal inside the selected district lens.",
-            limit=20,
-        )
-    with lower_right:
-        render_table(
-            "Recent Incidents",
-            incident_rows,
-            caption="Filtered incidents for the current detail district and analytic filter set.",
-            limit=20,
-        )
-        render_table(
-            "Geofence Alerts",
-            geofence_rows,
-            caption="Configured geofence zones and threshold states for the detail district.",
-            limit=16,
-        )
+        circle_lower_left, circle_lower_right = st.columns(2)
+        with circle_lower_left:
+            render_table(
+                "Statewide Police Circle Registry",
+                statewide_circle_rows,
+                caption="All Tamil Nadu station circles with lookout radius, priority, and station focus.",
+                limit=76,
+            )
+        with circle_lower_right:
+            render_table(
+                "Detail District Circles",
+                detail_circle_rows,
+                caption="Lookout circles for the selected district.",
+                limit=20,
+            )
 
 
 def render_fusion_center(district_scope: str, selected_case_id: int | None) -> None:
@@ -1774,6 +2156,144 @@ def render_watchlists_and_alerts(district_scope: str, selected_case_id: int | No
         )
 
 
+def render_department_comms(
+    district_scope: str,
+    selected_case_id: int | None,
+    me_payload: dict[str, Any],
+) -> None:
+    district_param = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
+    current_username = str(me_payload.get("username") or st.session_state.get("username") or "unknown")
+    directory_rows = rows_from_result(api_get("/personnel/directory"))
+    message_rows = rows_from_result(
+        api_get(
+            "/internal-comms/messages",
+            params=compact_params(
+                {
+                    "district": district_param,
+                    "recipient_username": current_username,
+                }
+            ) or None,
+        )
+    )
+    room_rows = summarize_comms_rooms(message_rows)
+    available_rooms = sorted({str(row.get("room_name")) for row in room_rows if row.get("room_name")})
+    direct_count = sum(1 for row in message_rows if row.get("recipient_username") not in (None, "", "N/A"))
+    ack_required_count = sum(1 for row in message_rows if str(row.get("ack_required")).lower() == "yes")
+
+    render_hero(
+        "Department Comms",
+        "Operational coordination channels for statewide command, district rooms, case escalation, and direct personnel messaging.",
+        eyebrow="Internal Coordination Fabric",
+        chips=[
+            f"User: {current_username}",
+            f"District lens: {district_scope}",
+            f"Rooms: {len(room_rows)}",
+            f"Messages: {len(message_rows)}",
+        ],
+    )
+
+    render_metric_grid(
+        [
+            ("Personnel Visible", len(directory_rows)),
+            ("Active Rooms", len(room_rows)),
+            ("Messages Loaded", len(message_rows)),
+            ("Direct Messages", direct_count),
+            ("Ack Required", ack_required_count),
+            ("Case Lens", selected_case_id if selected_case_id is not None else "None"),
+        ]
+    )
+
+    room_filter_left, room_filter_mid, room_filter_right = st.columns([1.0, 1.0, 0.9])
+    with room_filter_left:
+        room_filter = st.selectbox("Room filter", ["All Rooms"] + available_rooms, key="comms_room_filter")
+    with room_filter_mid:
+        scope_filter = st.selectbox("Channel scope", ["all", "statewide", "district", "direct", "case"], key="comms_scope_filter")
+    with room_filter_right:
+        priority_filter = st.selectbox("Priority", ["all", "routine", "medium", "high", "critical"], key="comms_priority_filter")
+
+    filtered_message_rows = []
+    for row in message_rows:
+        if room_filter != "All Rooms" and str(row.get("room_name")) != room_filter:
+            continue
+        if scope_filter != "all" and str(row.get("channel_scope")) != scope_filter:
+            continue
+        if priority_filter != "all" and str(row.get("priority")) != priority_filter:
+            continue
+        filtered_message_rows.append(row)
+
+    tabs = st.tabs(["Live Feed", "Compose", "Directory"])
+    with tabs[0]:
+        feed_left, feed_right = st.columns([1.18, 0.82])
+        with feed_left:
+            render_message_feed(filtered_message_rows)
+        with feed_right:
+            render_table(
+                "Coordination Rooms",
+                room_rows,
+                caption="Current rooms, latest activity, and priority-message counts for the filtered comms surface.",
+                limit=12,
+            )
+            render_table(
+                "Personnel Posture",
+                directory_rows,
+                caption="Visible personnel roster with role, district scope, and status posture.",
+                limit=12,
+            )
+
+    with tabs[1]:
+        room_choices = ["State Command Net", "Cyber Fusion Desk", "District Coordination", "Case Coordination", "Direct Coordination", "Custom Room"]
+        recipient_choices = ["None"] + [str(row.get("username")) for row in directory_rows if row.get("username") != current_username]
+        with st.form("department_comms_form"):
+            selected_room = st.selectbox("Room", room_choices, index=0)
+            custom_room = st.text_input("Custom room name", value="", disabled=selected_room != "Custom Room")
+            channel_scope = st.selectbox("Channel scope", ["statewide", "district", "direct", "case"], index=0)
+            compose_district = st.text_input(
+                "District",
+                value="" if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope,
+                disabled=channel_scope not in {"district", "case"},
+            )
+            recipient_username = st.selectbox(
+                "Direct recipient",
+                recipient_choices,
+                index=0,
+                disabled=channel_scope != "direct",
+            )
+            priority = st.selectbox("Priority", ["routine", "medium", "high", "critical"], index=0)
+            ack_required = st.checkbox("Acknowledge required")
+            message_text = st.text_area("Message", height=140, placeholder="Type the operational instruction, coordination note, or escalation context.")
+            if st.form_submit_button("Send message", use_container_width=True):
+                room_name = custom_room.strip() if selected_room == "Custom Room" else selected_room
+                payload = {
+                    "room_name": room_name or "State Command Net",
+                    "message_text": message_text,
+                    "channel_scope": channel_scope,
+                    "district": compose_district if channel_scope in {"district", "case"} else None,
+                    "recipient_username": None if recipient_username == "None" or channel_scope != "direct" else recipient_username,
+                    "priority": priority,
+                    "ack_required": ack_required,
+                    "case_id": selected_case_id if channel_scope == "case" else None,
+                }
+                run_action_and_refresh(
+                    "/internal-comms/messages",
+                    payload=payload,
+                    success_message="Department message sent.",
+                )
+
+    with tabs[2]:
+        render_table(
+            "Personnel Directory",
+            directory_rows,
+            caption="Department-visible personnel and their current coordination posture.",
+            limit=20,
+        )
+        render_table(
+            "Room Registry",
+            room_rows,
+            caption="Rooms currently in use, including latest sender, scope, and latest activity.",
+            limit=20,
+        )
+
+
 def render_tasking_and_exports(district_scope: str, selected_case_id: int | None, current_role: str) -> None:
     district_param = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
     task_result = api_get("/tasks", params=compact_params({"district": district_param, "case_id": selected_case_id}) or None)
@@ -2098,6 +2618,7 @@ with st.sidebar:
             "Case Dossier",
             "District Command",
             "Watchlists and Alerts",
+            "Department Comms",
             "Tasking and Exports",
             "Intake and Search",
             "Explorer",
@@ -2121,6 +2642,8 @@ elif workspace == "District Command":
     render_district_command(district_scope, me_payload, case_rows)
 elif workspace == "Watchlists and Alerts":
     render_watchlists_and_alerts(district_scope, selected_case_id)
+elif workspace == "Department Comms":
+    render_department_comms(district_scope, selected_case_id, me_payload)
 elif workspace == "Tasking and Exports":
     render_tasking_and_exports(district_scope, selected_case_id, current_role)
 elif workspace == "Intake and Search":

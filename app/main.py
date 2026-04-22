@@ -10,7 +10,7 @@ from jose import jwt, JWTError
 from app.config import JWT_SECRET, JWT_ALGORITHM
 from app.schemas import (
     LoginRequest, ComplaintCreate, CaseCreate, CaseCommentCreate,
-    CaseAssignCreate, ComplaintCaseLinkCreate, WatchlistCreate, EvidenceCreate
+    CaseAssignCreate, ComplaintCaseLinkCreate, WatchlistCreate, EvidenceCreate, DepartmentMessageCreate
 )
 from db.database import get_db
 from db.models import (
@@ -18,7 +18,7 @@ from db.models import (
     CaseComment, CaseAssignment, Incident, IngestQueue, ComplaintCaseLink, ConnectorRegistry,
     Watchlist, WatchlistHit, EvidenceAttachment, CaseTimelineEvent, StationRoutingRule,
     ProsecutionPacket, CustodyLog, MedicalCheckLog, EventCommandBoard,
-    DocumentIntake, ExtractedEntity, CourtHearing, PrisonMovement, NotificationEvent, GraphSnapshot, GeoFenceAlert, AdapterStub, TaskQueue, TaskExecution, SuspectDossier, GraphInsight, CourtPacketExport, EvidenceIntegrityLog, NarrativeBrief, HotspotForecast, PatrolCoverageMetric, SimilarityHit, TimelineDigest, ExportJob, WarRoomSnapshot, ExplorationBookmark
+    DocumentIntake, ExtractedEntity, CourtHearing, PrisonMovement, NotificationEvent, DepartmentMessage, GraphSnapshot, GeoFenceAlert, AdapterStub, TaskQueue, TaskExecution, SuspectDossier, GraphInsight, CourtPacketExport, EvidenceIntegrityLog, NarrativeBrief, HotspotForecast, PatrolCoverageMetric, SimilarityHit, TimelineDigest, ExportJob, WarRoomSnapshot, ExplorationBookmark
 )
 from services.auth import verify_password, create_access_token
 from services.permissions import (
@@ -549,6 +549,107 @@ def dispatch_notifications(db: Session = Depends(get_db), user: User = Depends(c
     log_action(db, user.username, 'dispatch_notifications', 'notification_events', str(count))
     db.commit()
     return {"sent": count}
+
+@app.get('/personnel/directory')
+def personnel_directory(user=Depends(current_user), db: Session = Depends(get_db)):
+    role_lookup = {row.id: row.name for row in db.query(Role).all()}
+    rows = db.query(User).filter(User.is_active == True).order_by(User.username).all()
+    output = []
+    for row in rows:
+        role = role_lookup.get(row.role_id, "viewer")
+        status = "available"
+        if role == "admin":
+            status = "command"
+        elif role == "district_sp":
+            status = "district_duty"
+        elif role == "cyber_analyst":
+            status = "fusion_watch"
+        output.append(
+            {
+                "username": row.username,
+                "full_name": row.full_name,
+                "role": role,
+                "district": row.district,
+                "status": status,
+                "scope": row.district or "statewide",
+            }
+        )
+    return output
+
+@app.get('/internal-comms/messages')
+def internal_comms_messages(
+    district: str | None = None,
+    room_name: str | None = None,
+    channel_scope: str | None = None,
+    case_id: int | None = None,
+    recipient_username: str | None = None,
+    limit: int = 120,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(DepartmentMessage)
+    if district:
+        q = q.filter(or_(DepartmentMessage.district == district, DepartmentMessage.district == None))
+    if room_name:
+        q = q.filter(DepartmentMessage.room_name == room_name)
+    if channel_scope:
+        q = q.filter(DepartmentMessage.channel_scope == channel_scope)
+    if case_id:
+        q = q.filter(DepartmentMessage.case_id == case_id)
+    if recipient_username:
+        q = q.filter(or_(DepartmentMessage.recipient_username == recipient_username, DepartmentMessage.recipient_username == None))
+
+    rows = q.order_by(DepartmentMessage.id.desc()).limit(min(limit, 200)).all()
+    return [{
+        "id": row.id,
+        "sender_username": row.sender_username,
+        "recipient_username": row.recipient_username,
+        "district": row.district,
+        "room_name": row.room_name,
+        "channel_scope": row.channel_scope,
+        "priority": row.priority,
+        "message_text": row.message_text,
+        "ack_required": row.ack_required,
+        "case_id": row.case_id,
+        "created_at": row.created_at.isoformat(),
+    } for row in rows]
+
+@app.post('/internal-comms/messages')
+def create_internal_comms_message(
+    body: DepartmentMessageCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    row = DepartmentMessage(
+        sender_username=user.username,
+        recipient_username=body.recipient_username,
+        district=body.district,
+        room_name=body.room_name,
+        channel_scope=body.channel_scope,
+        priority=body.priority,
+        message_text=body.message_text,
+        ack_required=body.ack_required,
+        case_id=body.case_id,
+    )
+    db.add(row)
+    db.flush()
+
+    recipient = body.recipient_username or body.room_name
+    db.add(
+        NotificationEvent(
+            notification_type="internal_message",
+            channel="in_app",
+            recipient=recipient,
+            subject=f"{body.room_name} update",
+            message=body.message_text,
+            status="queued",
+            related_object_type="department_message",
+            related_object_id=str(row.id),
+        )
+    )
+    log_action(db, user.username, 'create_department_message', 'department_message', str(row.id))
+    db.commit()
+    return {"status": "created", "message_id": row.id}
 
 @app.get('/graph/case/{case_id}')
 def case_graph(case_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):

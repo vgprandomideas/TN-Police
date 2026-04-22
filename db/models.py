@@ -327,6 +327,20 @@ class NotificationEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     sent_at = Column(DateTime)
 
+class DepartmentMessage(Base):
+    __tablename__ = "department_messages"
+    id = Column(Integer, primary_key=True)
+    sender_username = Column(String(80), nullable=False)
+    recipient_username = Column(String(80))
+    district = Column(String(80))
+    room_name = Column(String(120), nullable=False)
+    channel_scope = Column(String(40), default="statewide")
+    priority = Column(String(30), default="routine")
+    message_text = Column(Text, nullable=False)
+    ack_required = Column(Boolean, default=False)
+    case_id = Column(Integer, ForeignKey("cases.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class GraphSnapshot(Base):
     __tablename__ = "graph_snapshots"
     id = Column(Integer, primary_key=True)

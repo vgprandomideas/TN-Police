@@ -7,9 +7,11 @@ from db.models import (
     Case,
     CaseTimelineEvent,
     ConnectorRegistry,
+    DepartmentMessage,
     EvidenceAttachment,
     EvidenceIntegrityLog,
     NarrativeBrief,
+    NotificationEvent,
     Role,
     Station,
     StationRoutingRule,
@@ -219,6 +221,84 @@ def seed_case_activity_demo(db):
 
     db.commit()
 
+
+def seed_department_messages(db):
+    demo_messages = [
+        {
+            "sender_username": "admin_tn",
+            "recipient_username": None,
+            "district": None,
+            "room_name": "State Command Net",
+            "channel_scope": "statewide",
+            "priority": "high",
+            "message_text": "Statewide command watch is active. District control rooms will post live field escalations in this channel.",
+            "ack_required": True,
+            "case_id": None,
+        },
+        {
+            "sender_username": "cyber_analyst",
+            "recipient_username": None,
+            "district": None,
+            "room_name": "Cyber Fusion Desk",
+            "channel_scope": "statewide",
+            "priority": "routine",
+            "message_text": "Cyber fraud cluster review is open. Share device, SIM, and beneficiary overlaps here before opening a new linkage request.",
+            "ack_required": False,
+            "case_id": 3,
+        },
+        {
+            "sender_username": "district_sp",
+            "recipient_username": None,
+            "district": "Chennai",
+            "room_name": "Chennai District Coordination",
+            "channel_scope": "district",
+            "priority": "medium",
+            "message_text": "Night patrol supervisors should confirm hotspot deployment and CCTV blind-spot coverage around the current priority corridors.",
+            "ack_required": True,
+            "case_id": None,
+        },
+        {
+            "sender_username": "admin_tn",
+            "recipient_username": "viewer",
+            "district": None,
+            "room_name": "Direct Coordination",
+            "channel_scope": "direct",
+            "priority": "routine",
+            "message_text": "Use the Geo Command workspace to inspect statewide district pressure, then acknowledge the surveillance coverage summary.",
+            "ack_required": False,
+            "case_id": None,
+        },
+    ]
+
+    for payload in demo_messages:
+        exists = db.query(DepartmentMessage).filter_by(
+            sender_username=payload["sender_username"],
+            room_name=payload["room_name"],
+            message_text=payload["message_text"],
+        ).first()
+        if exists:
+            continue
+
+        message_row = DepartmentMessage(**payload)
+        db.add(message_row)
+        db.flush()
+
+        recipient = payload["recipient_username"] or payload["room_name"]
+        db.add(
+            NotificationEvent(
+                notification_type="internal_message",
+                channel="in_app",
+                recipient=recipient,
+                subject=f"{payload['room_name']} update",
+                message=payload["message_text"],
+                status="queued",
+                related_object_type="department_message",
+                related_object_id=str(message_row.id),
+            )
+        )
+
+    db.commit()
+
 def main():
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -229,6 +309,7 @@ def main():
         seed_connectors(db)
         seed_routing_rules(db)
         seed_case_activity_demo(db)
+        seed_department_messages(db)
     finally:
         db.close()
 

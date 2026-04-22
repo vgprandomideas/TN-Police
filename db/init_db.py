@@ -6,12 +6,14 @@ from db.models import (
     AlertRule,
     Case,
     CaseTimelineEvent,
+    CheckpointPlan,
     ConnectorRegistry,
     DepartmentMessage,
     EvidenceAttachment,
     EvidenceIntegrityLog,
     NarrativeBrief,
     NotificationEvent,
+    PersonnelPresence,
     Role,
     Station,
     StationRoutingRule,
@@ -299,6 +301,74 @@ def seed_department_messages(db):
 
     db.commit()
 
+
+def seed_personnel_presence(db):
+    demo_presence = [
+        {"username": "admin_tn", "room_name": "State Command Net", "district": None, "status_label": "command"},
+        {"username": "cyber_analyst", "room_name": "Cyber Fusion Desk", "district": "Chennai", "status_label": "fusion_watch"},
+        {"username": "district_sp", "room_name": "Chennai District Coordination", "district": "Chennai", "status_label": "district_duty"},
+        {"username": "viewer", "room_name": "State Command Net", "district": None, "status_label": "observer"},
+    ]
+    for payload in demo_presence:
+        exists = db.query(PersonnelPresence).filter_by(username=payload["username"]).first()
+        if exists:
+            continue
+        db.add(PersonnelPresence(**payload))
+    db.commit()
+
+
+def seed_checkpoint_plans(db):
+    demo_checkpoints = [
+        {
+            "district": "Chennai",
+            "checkpoint_name": "OMR Corridor Intercept Grid",
+            "checkpoint_type": "vehicle_intercept",
+            "route_ref": "vehicle-1",
+            "status": "active",
+            "assigned_unit": "Traffic Intercept Unit Alpha",
+            "latitude": 13.0677,
+            "longitude": 80.2787,
+            "case_id": 1,
+            "notes": "Monitor outbound corridor traffic and ANPR hits during cyber-fraud suspect movement window.",
+            "created_by": "admin_tn",
+        },
+        {
+            "district": "Coimbatore",
+            "checkpoint_name": "Avinashi Road Tech Sweep",
+            "checkpoint_type": "device_screening",
+            "route_ref": "suspect-1",
+            "status": "planned",
+            "assigned_unit": "Cyber Mobile Team 2",
+            "latitude": 11.0018,
+            "longitude": 76.9638,
+            "case_id": 3,
+            "notes": "Device screening checkpoint aligned to SIM-swap convergence route.",
+            "created_by": "cyber_analyst",
+        },
+        {
+            "district": "Madurai",
+            "checkpoint_name": "South Junction Patrol Polygon",
+            "checkpoint_type": "perimeter_lock",
+            "route_ref": "vehicle-2",
+            "status": "planned",
+            "assigned_unit": "District Response Team",
+            "latitude": 9.9252,
+            "longitude": 78.1198,
+            "case_id": None,
+            "notes": "Temporary perimeter lock for high-severity corridor movement review.",
+            "created_by": "district_sp",
+        },
+    ]
+    for payload in demo_checkpoints:
+        exists = db.query(CheckpointPlan).filter_by(
+            district=payload["district"],
+            checkpoint_name=payload["checkpoint_name"],
+        ).first()
+        if exists:
+            continue
+        db.add(CheckpointPlan(**payload))
+    db.commit()
+
 def main():
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -310,6 +380,8 @@ def main():
         seed_routing_rules(db)
         seed_case_activity_demo(db)
         seed_department_messages(db)
+        seed_personnel_presence(db)
+        seed_checkpoint_plans(db)
     finally:
         db.close()
 

@@ -349,6 +349,31 @@ class DepartmentMessageRead(Base):
     last_read_message_id = Column(Integer, nullable=False, default=0)
     read_at = Column(DateTime, default=datetime.utcnow)
 
+class PersonnelPresence(Base):
+    __tablename__ = "personnel_presence"
+    id = Column(Integer, primary_key=True)
+    username = Column(String(80), nullable=False)
+    room_name = Column(String(120))
+    district = Column(String(80))
+    status_label = Column(String(40), default="available")
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+
+class CheckpointPlan(Base):
+    __tablename__ = "checkpoint_plans"
+    id = Column(Integer, primary_key=True)
+    district = Column(String(80), nullable=False)
+    checkpoint_name = Column(String(160), nullable=False)
+    checkpoint_type = Column(String(60), default="vehicle_intercept")
+    route_ref = Column(String(120))
+    status = Column(String(40), default="planned")
+    assigned_unit = Column(String(120))
+    latitude = Column(Float)
+    longitude = Column(Float)
+    case_id = Column(Integer, ForeignKey("cases.id"), nullable=True)
+    notes = Column(Text)
+    created_by = Column(String(80), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class GraphSnapshot(Base):
     __tablename__ = "graph_snapshots"
     id = Column(Integer, primary_key=True)

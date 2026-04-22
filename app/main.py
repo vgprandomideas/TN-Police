@@ -11,7 +11,7 @@ from app.config import JWT_SECRET, JWT_ALGORITHM
 from app.schemas import (
     LoginRequest, ComplaintCreate, CaseCreate, CaseCommentCreate,
     CaseAssignCreate, ComplaintCaseLinkCreate, WatchlistCreate, EvidenceCreate,
-    DepartmentMessageCreate, DepartmentMessageReadCreate
+    DepartmentMessageCreate, DepartmentMessageReadCreate, PresenceHeartbeatCreate, CheckpointPlanCreate
 )
 from db.database import get_db
 from db.models import (
@@ -19,7 +19,7 @@ from db.models import (
     CaseComment, CaseAssignment, Incident, IngestQueue, ComplaintCaseLink, ConnectorRegistry,
     Watchlist, WatchlistHit, EvidenceAttachment, CaseTimelineEvent, StationRoutingRule,
     ProsecutionPacket, CustodyLog, MedicalCheckLog, EventCommandBoard,
-    DocumentIntake, ExtractedEntity, CourtHearing, PrisonMovement, NotificationEvent, DepartmentMessage, DepartmentMessageRead, GraphSnapshot, GeoFenceAlert, AdapterStub, TaskQueue, TaskExecution, SuspectDossier, GraphInsight, CourtPacketExport, EvidenceIntegrityLog, NarrativeBrief, HotspotForecast, PatrolCoverageMetric, SimilarityHit, TimelineDigest, ExportJob, WarRoomSnapshot, ExplorationBookmark
+    DocumentIntake, ExtractedEntity, CourtHearing, PrisonMovement, NotificationEvent, DepartmentMessage, DepartmentMessageRead, PersonnelPresence, CheckpointPlan, GraphSnapshot, GeoFenceAlert, AdapterStub, TaskQueue, TaskExecution, SuspectDossier, GraphInsight, CourtPacketExport, EvidenceIntegrityLog, NarrativeBrief, HotspotForecast, PatrolCoverageMetric, SimilarityHit, TimelineDigest, ExportJob, WarRoomSnapshot, ExplorationBookmark
 )
 from services.auth import verify_password, create_access_token
 from services.permissions import (
@@ -625,6 +625,62 @@ def serialize_department_message(row: DepartmentMessage, current_username: str, 
         "created_at": row.created_at.isoformat(),
     }
 
+@app.get('/personnel/presence')
+def personnel_presence(
+    district: str | None = None,
+    room_name: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    role_lookup = {row.id: row.name for row in db.query(Role).all()}
+    presence_lookup = {
+        row.username: row
+        for row in db.query(PersonnelPresence).order_by(PersonnelPresence.last_seen_at.desc()).all()
+    }
+    current_time = datetime.utcnow()
+    rows = []
+    for row in db.query(User).filter(User.is_active == True).order_by(User.username).all():
+        role = role_lookup.get(row.role_id, "viewer")
+        presence = presence_lookup.get(row.username)
+        if district and row.district not in {district, None}:
+            continue
+        if room_name and presence and presence.room_name not in {room_name, None}:
+            continue
+        last_seen_at = presence.last_seen_at if presence else None
+        seconds_since_seen = int((current_time - last_seen_at).total_seconds()) if last_seen_at else None
+        is_online = seconds_since_seen is not None and seconds_since_seen <= 180
+        rows.append(
+            {
+                "username": row.username,
+                "full_name": row.full_name,
+                "role": role,
+                "district": row.district,
+                "room_name": None if presence is None else presence.room_name,
+                "status_label": "offline" if not is_online else (presence.status_label if presence else "available"),
+                "is_online": is_online,
+                "last_seen_at": None if last_seen_at is None else last_seen_at.isoformat(),
+                "seconds_since_seen": seconds_since_seen,
+            }
+        )
+    return rows
+
+@app.post('/personnel/presence/heartbeat')
+def personnel_presence_heartbeat(
+    body: PresenceHeartbeatCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    row = db.query(PersonnelPresence).filter(PersonnelPresence.username == user.username).first()
+    if not row:
+        row = PersonnelPresence(username=user.username)
+        db.add(row)
+    row.room_name = body.room_name
+    row.district = body.district or user.district
+    row.status_label = body.status_label
+    row.last_seen_at = datetime.utcnow()
+    db.commit()
+    return {"status": "ok", "username": user.username, "last_seen_at": row.last_seen_at.isoformat()}
+
 @app.get('/internal-comms/rooms')
 def internal_comms_rooms(
     district: str | None = None,
@@ -774,6 +830,57 @@ def mark_internal_comms_read(
     log_action(db, user.username, 'mark_department_room_read', 'department_room', body.room_name)
     db.commit()
     return {"status": "ok", "room_name": body.room_name, "last_read_message_id": receipt.last_read_message_id}
+
+@app.get('/checkpoint-plans')
+def checkpoint_plans(
+    district: str | None = None,
+    status: str | None = None,
+    route_ref: str | None = None,
+    case_id: int | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(CheckpointPlan)
+    current_role = role_name(db, user)
+    if current_role == 'district_sp' and user.district:
+        q = q.filter(CheckpointPlan.district == user.district)
+    elif district:
+        q = q.filter(CheckpointPlan.district == district)
+    if status:
+        q = q.filter(CheckpointPlan.status == status)
+    if route_ref:
+        q = q.filter(CheckpointPlan.route_ref == route_ref)
+    if case_id:
+        q = q.filter(CheckpointPlan.case_id == case_id)
+    rows = q.order_by(CheckpointPlan.id.desc()).all()
+    return [{
+        "id": row.id,
+        "district": row.district,
+        "checkpoint_name": row.checkpoint_name,
+        "checkpoint_type": row.checkpoint_type,
+        "route_ref": row.route_ref,
+        "status": row.status,
+        "assigned_unit": row.assigned_unit,
+        "latitude": row.latitude,
+        "longitude": row.longitude,
+        "case_id": row.case_id,
+        "notes": row.notes,
+        "created_by": row.created_by,
+        "created_at": row.created_at.isoformat(),
+    } for row in rows]
+
+@app.post('/checkpoint-plans')
+def create_checkpoint_plan(
+    body: CheckpointPlanCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    row = CheckpointPlan(**body.model_dump(), created_by=user.username)
+    db.add(row)
+    db.flush()
+    log_action(db, user.username, 'create_checkpoint_plan', 'checkpoint_plan', str(row.id))
+    db.commit()
+    return {"status": "created", "checkpoint_id": row.id}
 
 @app.get('/graph/case/{case_id}')
 def case_graph(case_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):

@@ -58,3 +58,22 @@ class DepartmentMessageCreate(BaseModel):
 class DepartmentMessageReadCreate(BaseModel):
     room_name: str
     last_read_message_id: int | None = None
+
+
+class PresenceHeartbeatCreate(BaseModel):
+    room_name: str | None = None
+    district: str | None = None
+    status_label: str = "active"
+
+
+class CheckpointPlanCreate(BaseModel):
+    district: str
+    checkpoint_name: str
+    checkpoint_type: str = "vehicle_intercept"
+    route_ref: str | None = None
+    status: str = "planned"
+    assigned_unit: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    case_id: int | None = None
+    notes: str | None = None

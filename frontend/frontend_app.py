@@ -4,7 +4,9 @@ from collections import defaultdict
 import csv
 from itertools import combinations
 import json
+import math
 import os
+import time
 from html import escape
 from pathlib import Path
 from typing import Any, Callable
@@ -828,6 +830,372 @@ def build_route_svg(
                 stroke="rgba(118,183,255,0.35)" stroke-width="3" />
             {"".join(route_markup)}
             {"".join(point_markup)}
+        </svg>
+    </div>
+    """
+
+
+def build_regular_polygon_points(cx: float, cy: float, radius: float, sides: int = 6, rotation_deg: float = -30.0) -> str:
+    points = []
+    for index in range(sides):
+        angle = math.radians(rotation_deg + ((360 / sides) * index))
+        x = cx + (math.cos(angle) * radius)
+        y = cy + (math.sin(angle) * radius)
+        points.append(f"{x:.1f},{y:.1f}")
+    return " ".join(points)
+
+
+def build_operational_polygon_svg(
+    title: str,
+    subtitle: str,
+    district_rows: list[dict[str, Any]],
+    checkpoint_rows: list[dict[str, Any]],
+    selected_district: str | None = None,
+    link_getter: Callable[[dict[str, Any]], str | None] | None = None,
+) -> str:
+    width = 980
+    height = 760
+    padding = 70
+    if not district_rows:
+        return '<div class="tn-inline-note">Operational polygon data is not available for the current selection.</div>'
+
+    all_lons = [coord[0] for coord in TN_STATE_OUTLINE] + [to_float(row.get("longitude")) for row in district_rows]
+    all_lats = [coord[1] for coord in TN_STATE_OUTLINE] + [to_float(row.get("latitude")) for row in district_rows]
+    min_lon, max_lon = min(all_lons), max(all_lons)
+    min_lat, max_lat = min(all_lats), max(all_lats)
+    outline_points = []
+    for lon, lat in TN_STATE_OUTLINE:
+        x, y = project_geo_point(lon, lat, min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        outline_points.append(f"{x:.1f},{y:.1f}")
+    outline_markup = " ".join(outline_points)
+
+    max_intensity = max((to_float(row.get("intensity")) for row in district_rows), default=1.0)
+    polygon_markup: list[str] = []
+    for row in district_rows:
+        district = str(row.get("district") or "Unknown")
+        x, y = project_geo_point(to_float(row.get("longitude")), to_float(row.get("latitude")), min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        intensity = to_float(row.get("intensity"))
+        radius = 20 + ((intensity / max(max_intensity, 1.0)) * 30)
+        polygon_points = build_regular_polygon_points(x, y, radius)
+        fill = interpolate_color((36, 93, 168), (255, 140, 66), intensity / max(max_intensity, 1.0))
+        stroke = "#ffe2bf" if selected_district == district else "rgba(216, 230, 255, 0.72)"
+        body = (
+            f'<polygon points="{polygon_points}" fill="{fill}" fill-opacity="0.20" stroke="{stroke}" stroke-width="2.2">'
+            f'<title>{escape(district)} | Intensity: {row.get("intensity")} | Incidents: {row.get("incident_count")}</title>'
+            '</polygon>'
+            f'<text x="{x:.1f}" y="{(y + 4):.1f}" text-anchor="middle" '
+            'style="fill:#eaf2ff;font-size:10.6px;font-family:system-ui,sans-serif;font-weight:700;">'
+            f"{escape(district)}</text>"
+        )
+        if link_getter:
+            polygon_url = link_getter(row)
+            if polygon_url:
+                body = f'<a href="{escape(polygon_url, quote=True)}" target="_top" style="text-decoration:none;">{body}</a>'
+        polygon_markup.append(f"<g>{body}</g>")
+
+    checkpoint_markup: list[str] = []
+    for row in checkpoint_rows:
+        latitude = row.get("latitude")
+        longitude = row.get("longitude")
+        if latitude in (None, "", "N/A") or longitude in (None, "", "N/A"):
+            continue
+        x, y = project_geo_point(to_float(longitude), to_float(latitude), min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        status = str(row.get("status") or "planned")
+        color = "#ff8c42" if status in {"active", "deployed"} else "#76b7ff" if status == "planned" else "#b0bccf"
+        checkpoint_markup.append(
+            f"""
+            <g>
+                <polygon points="{build_regular_polygon_points(x, y, 9, sides=4, rotation_deg=45)}" fill="{color}" fill-opacity="0.88"
+                    stroke="#f8fbff" stroke-width="1.2">
+                    <title>{escape(str(row.get('checkpoint_name') or 'Checkpoint'))} | Status: {escape(status)} | Unit: {escape(str(row.get('assigned_unit') or 'Unassigned'))}</title>
+                </polygon>
+            </g>
+            """
+        )
+
+    return f"""
+    <div style="border:1px solid rgba(92,116,151,0.35);border-radius:24px;padding:1rem 1rem 0.7rem 1rem;
+        background:linear-gradient(180deg, rgba(15,25,40,0.98), rgba(10,18,28,0.96));">
+        <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:1rem;flex-wrap:wrap;">
+            <div>
+                <div style="color:#76b7ff;font-size:0.82rem;letter-spacing:0.12em;text-transform:uppercase;font-weight:700;">{escape(title)}</div>
+                <div style="color:#97a8c4;font-size:0.95rem;margin-top:0.25rem;">{escape(subtitle)}</div>
+            </div>
+            <div style="color:#97a8c4;font-size:0.82rem;">District polygons are operational sectors. Diamonds are checkpoints.</div>
+        </div>
+        <svg viewBox="0 0 {width} {height}" style="width:100%;height:auto;margin-top:0.8rem;">
+            <polygon points="{outline_markup}" fill="rgba(118,183,255,0.04)"
+                stroke="rgba(118,183,255,0.35)" stroke-width="3" />
+            {"".join(polygon_markup)}
+            {"".join(checkpoint_markup)}
+        </svg>
+    </div>
+    """
+
+
+def maybe_send_presence_heartbeat(room_name: str, district_scope: str, status_label: str = "active") -> None:
+    now = time.time()
+    last_ping = float(st.session_state.get("presence_last_ping_ts", 0.0))
+    last_room = str(st.session_state.get("presence_last_room", ""))
+    last_district = str(st.session_state.get("presence_last_district", ""))
+    payload_district = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
+    if (now - last_ping) < 25 and room_name == last_room and str(payload_district or "") == last_district:
+        return
+    result = api_post(
+        "/personnel/presence/heartbeat",
+        payload={
+            "room_name": room_name,
+            "district": payload_district,
+            "status_label": status_label,
+        },
+    )
+    if result.get("ok"):
+        st.session_state.presence_last_ping_ts = now
+        st.session_state.presence_last_room = room_name
+        st.session_state.presence_last_district = str(payload_district or "")
+
+
+def activate_live_refresh(enabled: bool, interval_seconds: int = 20, component_key: str = "live_refresh") -> None:
+    if not enabled:
+        return
+    components.html(
+        f"""
+        <script>
+        const timerKey = "{escape(component_key)}";
+        window.clearTimeout(window[timerKey]);
+        window[timerKey] = window.setTimeout(function() {{
+            try {{
+                if (window.parent && window.parent.location) {{
+                    window.parent.location.reload();
+                }} else {{
+                    window.location.reload();
+                }}
+            }} catch (error) {{
+                window.location.reload();
+            }}
+        }}, {interval_seconds * 1000});
+        </script>
+        """,
+        height=0,
+    )
+
+
+def build_graph_canvas_payload(
+    entity_rows: list[dict[str, Any]],
+    link_rows: list[dict[str, Any]],
+    case_graph_payload: dict[str, Any] | None = None,
+    district_scope: str = DEFAULT_DISTRICT_SCOPE,
+    selected_node_id: str | None = None,
+) -> dict[str, Any]:
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, Any]] = []
+
+    for row in entity_rows:
+        district = str(row.get("district") or "")
+        if district_scope != DEFAULT_DISTRICT_SCOPE and district and district != district_scope:
+            continue
+        node_id = f"entity-{row.get('id')}"
+        nodes[node_id] = {
+            "id": node_id,
+            "label": str(row.get("name") or f"Entity {row.get('id')}"),
+            "type": str(row.get("type") or "entity"),
+            "district": district,
+            "risk_score": to_float(row.get("risk_score")),
+        }
+
+    for row in link_rows:
+        source_id = f"entity-{row.get('source')}"
+        target_id = f"entity-{row.get('target')}"
+        if source_id in nodes and target_id in nodes:
+            edges.append(
+                {
+                    "source": source_id,
+                    "target": target_id,
+                    "label": row.get("relationship_type"),
+                    "weight": to_float(row.get("weight"), 1.0),
+                }
+            )
+
+    if case_graph_payload:
+        for row in payload_to_rows(case_graph_payload.get("nodes")):
+            node_id = str(row.get("id") or "")
+            if not node_id:
+                continue
+            nodes[node_id] = {
+                "id": node_id,
+                "label": str(row.get("label") or node_id),
+                "type": str(row.get("type") or "entity"),
+                "district": str(row.get("district") or district_scope),
+                "risk_score": to_float(row.get("risk_score")),
+            }
+        for row in payload_to_rows(case_graph_payload.get("edges")):
+            source_id = str(row.get("source") or "")
+            target_id = str(row.get("target") or "")
+            if source_id in nodes and target_id in nodes:
+                edges.append(
+                    {
+                        "source": source_id,
+                        "target": target_id,
+                        "label": row.get("label"),
+                        "weight": to_float(row.get("weight"), 1.0),
+                    }
+                )
+
+    adjacency: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in edges:
+        adjacency[row["source"]].append(row)
+        adjacency[row["target"]].append(row)
+
+    if not selected_node_id or selected_node_id not in nodes:
+        if case_graph_payload and any(node_id.startswith("case-") for node_id in nodes):
+            selected_node_id = next(node_id for node_id in nodes if node_id.startswith("case-"))
+        else:
+            selected_node_id = next(
+                (node_id for node_id, row in sorted(nodes.items(), key=lambda item: item[1].get("risk_score", 0.0), reverse=True)),
+                next(iter(nodes), None),
+            )
+
+    related_ids: list[str] = []
+    if selected_node_id:
+        for row in sorted(adjacency.get(selected_node_id, []), key=lambda item: item.get("weight", 0.0), reverse=True):
+            peer_id = row["target"] if row["source"] == selected_node_id else row["source"]
+            if peer_id not in related_ids:
+                related_ids.append(peer_id)
+    display_ids = []
+    if selected_node_id:
+        display_ids.append(selected_node_id)
+    display_ids.extend(related_ids[:14])
+    for node_id, row in sorted(nodes.items(), key=lambda item: item[1].get("risk_score", 0.0), reverse=True):
+        if node_id not in display_ids:
+            display_ids.append(node_id)
+        if len(display_ids) >= 26:
+            break
+
+    display_nodes = [nodes[node_id] for node_id in display_ids if node_id in nodes]
+    display_id_set = {row["id"] for row in display_nodes}
+    display_edges = [row for row in edges if row["source"] in display_id_set and row["target"] in display_id_set]
+    selected_node = nodes.get(selected_node_id) if selected_node_id else None
+    linked_rows = []
+    for row in display_edges:
+        if selected_node_id not in {row["source"], row["target"]}:
+            continue
+        peer_id = row["target"] if row["source"] == selected_node_id else row["source"]
+        peer_row = nodes.get(peer_id, {})
+        linked_rows.append(
+            {
+                "peer_id": peer_id,
+                "peer_label": peer_row.get("label"),
+                "peer_type": peer_row.get("type"),
+                "district": peer_row.get("district"),
+                "edge_label": row.get("label"),
+                "weight": row.get("weight"),
+            }
+        )
+
+    return {
+        "nodes": display_nodes,
+        "edges": display_edges,
+        "selected_node_id": selected_node_id,
+        "selected_node": selected_node,
+        "linked_rows": linked_rows,
+    }
+
+
+def build_graph_svg(
+    title: str,
+    subtitle: str,
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    selected_node_id: str | None = None,
+    link_getter: Callable[[dict[str, Any]], str | None] | None = None,
+) -> str:
+    width = 980
+    height = 760
+    center_x = width / 2
+    center_y = height / 2
+    type_colors = {
+        "person": "#ff8c42",
+        "vehicle": "#6bc7ff",
+        "phone": "#7ef0c4",
+        "device": "#7ef0c4",
+        "case": "#f6cf61",
+        "evidence": "#d68cff",
+        "account": "#8cc7ff",
+        "entity": "#9db0cc",
+    }
+    if not nodes:
+        return '<div class="tn-inline-note">Graph canvas data is not available for the current selection.</div>'
+
+    selected_row = next((row for row in nodes if row.get("id") == selected_node_id), nodes[0])
+    selected_node_id = str(selected_row.get("id"))
+    related_ids = {
+        row["target"] if row["source"] == selected_node_id else row["source"]
+        for row in edges
+        if selected_node_id in {row["source"], row["target"]}
+    }
+    outer_nodes = [row for row in nodes if row.get("id") not in related_ids and row.get("id") != selected_node_id]
+    related_nodes = [row for row in nodes if row.get("id") in related_ids]
+
+    positions: dict[str, tuple[float, float]] = {selected_node_id: (center_x, center_y)}
+    for index, row in enumerate(related_nodes):
+        angle = ((2 * math.pi) / max(len(related_nodes), 1)) * index
+        positions[str(row.get("id"))] = (center_x + (math.cos(angle) * 210), center_y + (math.sin(angle) * 210))
+    for index, row in enumerate(outer_nodes):
+        angle = ((2 * math.pi) / max(len(outer_nodes), 1)) * index
+        positions[str(row.get("id"))] = (center_x + (math.cos(angle) * 325), center_y + (math.sin(angle) * 325))
+
+    edge_markup = []
+    for row in edges:
+        source = positions.get(str(row.get("source")))
+        target = positions.get(str(row.get("target")))
+        if not source or not target:
+            continue
+        highlighted = selected_node_id in {row.get("source"), row.get("target")}
+        edge_markup.append(
+            f"""
+            <line x1="{source[0]:.1f}" y1="{source[1]:.1f}" x2="{target[0]:.1f}" y2="{target[1]:.1f}"
+                stroke="{'rgba(255, 140, 66, 0.65)' if highlighted else 'rgba(118, 183, 255, 0.22)'}"
+                stroke-width="{1.2 + min(to_float(row.get('weight'), 1.0), 5.0):.1f}">
+                <title>{escape(str(row.get('label') or 'linked'))}</title>
+            </line>
+            """
+        )
+
+    node_markup = []
+    for row in nodes:
+        node_id = str(row.get("id"))
+        x, y = positions.get(node_id, (center_x, center_y))
+        node_type = str(row.get("type") or "entity").lower()
+        color = type_colors.get(node_type, type_colors["entity"])
+        radius = 16 if node_id == selected_node_id else 11 + min(to_float(row.get("risk_score")), 1.0) * 8
+        stroke = "#ffe2bf" if node_id == selected_node_id else "#eaf2ff"
+        body = (
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{radius:.1f}" fill="{color}" fill-opacity="0.92" stroke="{stroke}" stroke-width="2.2">'
+            f'<title>{escape(str(row.get("label")))} | {escape(str(row.get("type")))} | District: {escape(str(row.get("district") or "statewide"))}</title>'
+            '</circle>'
+            f'<text x="{x:.1f}" y="{(y + radius + 15):.1f}" text-anchor="middle" '
+            'style="fill:#eaf2ff;font-size:10.8px;font-family:system-ui,sans-serif;font-weight:600;">'
+            f"{escape(str(row.get('label'))[:24])}</text>"
+        )
+        if link_getter:
+            node_url = link_getter(row)
+            if node_url:
+                body = f'<a href="{escape(node_url, quote=True)}" target="_top" style="text-decoration:none;">{body}</a>'
+        node_markup.append(f"<g>{body}</g>")
+
+    return f"""
+    <div style="border:1px solid rgba(92,116,151,0.35);border-radius:24px;padding:1rem 1rem 0.7rem 1rem;
+        background:linear-gradient(180deg, rgba(15,25,40,0.98), rgba(10,18,28,0.96));">
+        <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:1rem;flex-wrap:wrap;">
+            <div>
+                <div style="color:#76b7ff;font-size:0.82rem;letter-spacing:0.12em;text-transform:uppercase;font-weight:700;">{escape(title)}</div>
+                <div style="color:#97a8c4;font-size:0.95rem;margin-top:0.25rem;">{escape(subtitle)}</div>
+            </div>
+            <div style="color:#97a8c4;font-size:0.82rem;">Click nodes to focus the graph. Center node is the active selection.</div>
+        </div>
+        <svg viewBox="0 0 {width} {height}" style="width:100%;height:auto;margin-top:0.8rem;">
+            {"".join(edge_markup)}
+            {"".join(node_markup)}
         </svg>
     </div>
     """
@@ -1895,6 +2263,11 @@ def render_geo_command(district_scope: str) -> None:
         selected_route_label = st.selectbox("Tracked route overlay", list(route_option_map.keys()), index=list(route_option_map.keys()).index(default_route_label), key="geo_selected_route")
         selected_route_id = route_option_map.get(selected_route_label)
         set_query_param("ops_route", selected_route_id)
+    statewide_checkpoint_rows = rows_from_result(api_get("/checkpoint-plans"))
+    detail_checkpoint_rows = [
+        row for row in statewide_checkpoint_rows
+        if str(row.get("district")) == str(detail_district)
+    ]
     statewide_blind_spot_rows = build_blind_spot_rows(statewide_cctv_station_rows, statewide_patrol_rows, statewide_geofence_rows)
     detail_blind_spot_rows = build_blind_spot_rows(cctv_station_rows, detail_patrol_rows, geofence_rows)
     statewide_camera_registry_rows = build_camera_registry_rows(statewide_cctv_station_rows)
@@ -1905,6 +2278,7 @@ def render_geo_command(district_scope: str) -> None:
     max_intensity = max((to_float(row.get("intensity")) for row in district_map_rows), default=0.0)
     active_geofences = sum(1 for row in geofence_rows if str(row.get("active")).lower() == "yes")
     total_recommended_cameras = sum(to_int(row.get("recommended_cameras")) for row in cctv_district_rows)
+    active_checkpoints = sum(1 for row in statewide_checkpoint_rows if str(row.get("status")).lower() in {"active", "deployed"})
     render_metric_grid(
         [
             ("Districts Mapped", len(district_map_rows)),
@@ -1914,6 +2288,8 @@ def render_geo_command(district_scope: str) -> None:
             ("District Incidents", total_incidents),
             ("Peak District Intensity", round(max_intensity, 2)),
             ("Recommended CCTV Units", total_recommended_cameras),
+            ("Checkpoint Plans", len(statewide_checkpoint_rows)),
+            ("Active Checkpoints", active_checkpoints),
             ("Detail District", detail_district or "N/A"),
             ("Stations Visible", len(station_map_rows)),
             ("Filtered Incidents", len(incident_rows)),
@@ -1922,7 +2298,7 @@ def render_geo_command(district_scope: str) -> None:
         ]
     )
 
-    tabs = st.tabs(["Situation", "Movement Flows", "CCTV Ops", "Police Circles", "Routes", "Timeline Playback"])
+    tabs = st.tabs(["Situation", "Movement Flows", "CCTV Ops", "Police Circles", "Routes", "GIS and Checkpoints", "Timeline Playback"])
     with tabs[0]:
         map_left, map_right = st.columns([1.18, 0.82])
         with map_left:
@@ -2208,6 +2584,61 @@ def render_geo_command(district_scope: str) -> None:
 
     with tabs[5]:
         render_inline_note(
+            "Operational GIS polygons represent planning sectors for surveillance, interception, and patrol coordination. They are planning geometry, not official legal jurisdiction boundaries."
+        )
+        gis_left, gis_right = st.columns([1.15, 0.85])
+        with gis_left:
+            render_geo_html(
+                build_operational_polygon_svg(
+                    "Operational GIS Sector Map",
+                    "District polygons scale with operational intensity. Checkpoint diamonds show planned or active interception points.",
+                    selected_district_map_rows,
+                    statewide_checkpoint_rows,
+                    selected_district=detail_district,
+                    link_getter=district_link_getter,
+                ),
+                height=920,
+            )
+        with gis_right:
+            render_table(
+                "Checkpoint Registry",
+                detail_checkpoint_rows or statewide_checkpoint_rows,
+                caption="Checkpoint plans in the active district lens, including route assignment, status, unit, and notes.",
+                limit=18,
+            )
+            with st.expander("Create checkpoint plan", expanded=False):
+                route_choices = ["None"] + list(route_option_map.keys())
+                district_row = next((row for row in district_map_rows if str(row.get("district")) == str(detail_district)), {})
+                with st.form("checkpoint_plan_form"):
+                    checkpoint_name = st.text_input("Checkpoint name")
+                    checkpoint_type = st.selectbox("Checkpoint type", ["vehicle_intercept", "device_screening", "perimeter_lock", "patrol_gate"], index=0)
+                    checkpoint_status = st.selectbox("Status", ["planned", "active", "deployed", "completed"], index=0)
+                    assigned_unit = st.text_input("Assigned unit")
+                    selected_checkpoint_route = st.selectbox("Linked route", route_choices, index=0)
+                    checkpoint_latitude = st.text_input("Latitude", value=str(district_row.get("latitude") or ""))
+                    checkpoint_longitude = st.text_input("Longitude", value=str(district_row.get("longitude") or ""))
+                    checkpoint_notes = st.text_area("Checkpoint notes", height=110)
+                    if st.form_submit_button("Create checkpoint plan", use_container_width=True):
+                        payload = {
+                            "district": detail_district or district_scope,
+                            "checkpoint_name": checkpoint_name,
+                            "checkpoint_type": checkpoint_type,
+                            "route_ref": None if selected_checkpoint_route == "None" else route_option_map.get(selected_checkpoint_route),
+                            "status": checkpoint_status,
+                            "assigned_unit": assigned_unit or None,
+                            "latitude": to_float(checkpoint_latitude) if str(checkpoint_latitude).strip() else None,
+                            "longitude": to_float(checkpoint_longitude) if str(checkpoint_longitude).strip() else None,
+                            "case_id": selected_case_id,
+                            "notes": checkpoint_notes or None,
+                        }
+                        run_action_and_refresh(
+                            "/checkpoint-plans",
+                            payload=payload,
+                            success_message="Checkpoint plan created.",
+                        )
+
+    with tabs[6]:
+        render_inline_note(
             "Timeline playback reconstructs filtered incidents in chronological order. Slide through the sequence to see how the incident picture escalates across the selected district."
         )
         if playback_rows:
@@ -2254,6 +2685,302 @@ def render_geo_command(district_scope: str) -> None:
                 )
         else:
             render_inline_note("No incident playback sequence is available for the active district and filter set.")
+
+
+def render_graph_fabric(district_scope: str, selected_case_id: int | None) -> None:
+    entity_rows = rows_from_result(api_get("/graph/entities"))
+    link_rows = rows_from_result(api_get("/graph/links"))
+    if district_scope != DEFAULT_DISTRICT_SCOPE:
+        entity_rows = [row for row in entity_rows if str(row.get("district")) == district_scope]
+
+    case_graph_payload: dict[str, Any] | None = None
+    if selected_case_id is not None:
+        case_graph_result = api_get(f"/graph/case/{selected_case_id}")
+        if case_graph_result.get("ok") and isinstance(case_graph_result.get("data"), dict):
+            case_graph_payload = case_graph_result["data"]
+
+    option_map: dict[str, str] = {}
+    for row in entity_rows:
+        option_map[f"{row.get('name')} | {row.get('type')} | {row.get('district') or 'statewide'}"] = f"entity-{row.get('id')}"
+    if case_graph_payload:
+        for row in payload_to_rows(case_graph_payload.get("nodes")):
+            node_id = str(row.get("id") or "")
+            if node_id:
+                option_map[f"{row.get('label')} | {row.get('type')}"] = node_id
+
+    query_node_id = get_query_param("ops_node")
+    if query_node_id and query_node_id in option_map.values() and st.session_state.get("graph_focus_node") != query_node_id:
+        st.session_state.graph_focus_node = query_node_id
+    selected_node_id = query_node_id if query_node_id in option_map.values() else None
+    if option_map:
+        reverse_option_map = {value: key for key, value in option_map.items()}
+        default_label = reverse_option_map.get(selected_node_id) or next(iter(option_map))
+        selected_label = st.selectbox(
+            "Graph focus node",
+            list(option_map.keys()),
+            index=list(option_map.keys()).index(default_label),
+            key="graph_focus_select",
+        )
+        selected_node_id = option_map[selected_label]
+        set_query_param("ops_node", selected_node_id)
+
+    payload = build_graph_canvas_payload(
+        entity_rows=entity_rows,
+        link_rows=link_rows,
+        case_graph_payload=case_graph_payload,
+        district_scope=district_scope,
+        selected_node_id=selected_node_id,
+    )
+    node_link_getter = lambda row: build_query_url({"ops_node": row.get("id")})
+    selected_node = payload.get("selected_node") or {}
+
+    render_hero(
+        "Graph Fabric",
+        "Interactive graph intelligence for entities, cases, evidence, and linked relationships across the active operational scope.",
+        eyebrow="Entity Graph Intelligence",
+        chips=[
+            f"District scope: {district_scope}",
+            f"Case focus: {selected_case_id if selected_case_id is not None else 'none'}",
+            f"Nodes: {len(payload.get('nodes', []))}",
+            f"Edges: {len(payload.get('edges', []))}",
+        ],
+    )
+    render_metric_grid(
+        [
+            ("Canvas Nodes", len(payload.get("nodes", []))),
+            ("Canvas Edges", len(payload.get("edges", []))),
+            ("Linked Neighbors", len(payload.get("linked_rows", []))),
+            ("Selected Type", selected_node.get("type", "N/A")),
+            ("Selected District", selected_node.get("district", "N/A")),
+            ("Risk Score", selected_node.get("risk_score", "N/A")),
+        ]
+    )
+
+    graph_left, graph_right = st.columns([1.2, 0.8])
+    with graph_left:
+        render_geo_html(
+            build_graph_svg(
+                "Entity Graph Canvas",
+                "Click nodes to refocus the graph around a suspect, vehicle, case, or evidence object.",
+                payload.get("nodes", []),
+                payload.get("edges", []),
+                selected_node_id=payload.get("selected_node_id"),
+                link_getter=node_link_getter,
+            ),
+            height=920,
+        )
+    with graph_right:
+        render_table(
+            "Selected Node",
+            [selected_node] if selected_node else [],
+            caption="Attributes for the currently selected graph node.",
+            limit=1,
+        )
+        render_table(
+            "Linked Neighbors",
+            payload.get("linked_rows", []),
+            caption="Immediate relationships and linked peers for the focused node.",
+            limit=20,
+        )
+        if case_graph_payload:
+            render_table(
+                "Case Graph Snapshot",
+                [case_graph_payload.get("snapshot", {})] if case_graph_payload.get("snapshot") else [],
+                caption="Current case graph density and summary for the active case lens.",
+                limit=1,
+            )
+
+    lower_left, lower_right = st.columns(2)
+    with lower_left:
+        render_table(
+            "Entity Registry",
+            sorted(entity_rows, key=lambda row: to_float(row.get("risk_score")), reverse=True),
+            caption="Entity registry rows available in the current scope.",
+            limit=25,
+        )
+    with lower_right:
+        render_table(
+            "Graph Edge Ledger",
+            payload.get("edges", []),
+            caption="Visible graph links currently rendered on the canvas.",
+            limit=25,
+        )
+
+
+def render_war_room(
+    district_scope: str,
+    selected_case_id: int | None,
+    me_payload: dict[str, Any],
+) -> None:
+    district_param = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
+    room_rows = rows_from_result(api_get("/internal-comms/rooms", params=compact_params({"district": district_param}) or None))
+    presence_rows = rows_from_result(api_get("/personnel/presence", params=compact_params({"district": district_param}) or None))
+    snapshot_rows = rows_from_result(api_get("/war-room-snapshots", params=compact_params({"district": district_param}) or None))
+    checkpoint_rows = rows_from_result(api_get("/checkpoint-plans", params=compact_params({"district": district_param}) or None))
+    district_rows = build_district_map_rows(rows_from_result(api_get("/geo/district-heatmap")))
+    cluster_rows = rows_from_result(api_get("/fusion/clusters"))
+    suspect_rows = rows_from_result(api_get("/suspect-dossiers"))
+    case_rows = rows_from_result(api_get("/cases"))
+    flow_rows = build_movement_flow_rows(district_rows, cluster_rows)
+    route_rows = build_route_rows(district_rows, flow_rows, suspect_rows, case_rows)
+    route_option_map = {f"{row.get('subject_label')} | {row.get('route_type')}": str(row.get("route_id")) for row in route_rows}
+
+    available_rooms = [str(row.get("room_name")) for row in room_rows if row.get("room_name")]
+    query_room = get_query_param("ops_room")
+    selected_room = query_room if query_room in available_rooms else (available_rooms[0] if available_rooms else "State Command Net")
+    if available_rooms:
+        selected_room = st.selectbox(
+            "War-room thread",
+            available_rooms,
+            index=available_rooms.index(selected_room),
+            key="war_room_thread",
+        )
+        set_query_param("ops_room", selected_room)
+    live_updates = st.checkbox("Live war-room updates", value=False, key="war_room_live_updates")
+    activate_live_refresh(live_updates, interval_seconds=18, component_key="war_room_live_refresh")
+    maybe_send_presence_heartbeat(selected_room, district_scope, status_label="war_room")
+
+    message_rows = rows_from_result(
+        api_get(
+            "/internal-comms/messages",
+            params=compact_params({"district": district_param, "room_name": selected_room}) or None,
+        )
+    )
+    selected_room_row = next((row for row in room_rows if str(row.get("room_name")) == str(selected_room)), {})
+
+    online_count = sum(1 for row in presence_rows if str(row.get("is_online")).lower() == "yes")
+    unread_total = sum(to_int(row.get("unread_count")) for row in room_rows)
+    active_checkpoints = sum(1 for row in checkpoint_rows if str(row.get("status")).lower() in {"active", "deployed"})
+
+    render_hero(
+        "War Room",
+        "Live coordination layer for room threads, personnel presence, checkpoint actions, and operational escalation context.",
+        eyebrow="Real-Time Coordination",
+        chips=[
+            f"District scope: {district_scope}",
+            f"Thread: {selected_room}",
+            f"Live updates: {'on' if live_updates else 'off'}",
+            f"Unread rooms: {unread_total}",
+        ],
+    )
+    render_metric_grid(
+        [
+            ("Online Personnel", online_count),
+            ("Room Unread", selected_room_row.get("unread_count", 0)),
+            ("Messages in Thread", len(message_rows)),
+            ("Checkpoint Plans", len(checkpoint_rows)),
+            ("Active Checkpoints", active_checkpoints),
+            ("War-Room Snapshots", len(snapshot_rows)),
+        ]
+    )
+
+    tabs = st.tabs(["Operations", "Live Chat", "Action Planner"])
+    with tabs[0]:
+        ops_left, ops_right = st.columns([1.08, 0.92])
+        with ops_left:
+            render_table(
+                "War-Room Snapshots",
+                snapshot_rows,
+                caption="Current war-room snapshots, command summaries, and active-case posture.",
+                limit=12,
+            )
+            render_table(
+                "Presence Board",
+                presence_rows,
+                caption="Live presence posture across command, fusion, and district personnel.",
+                limit=20,
+            )
+        with ops_right:
+            render_table(
+                "Coordination Rooms",
+                room_rows,
+                caption="Room activity, unread counts, and latest-message posture.",
+                limit=12,
+            )
+            render_table(
+                "Checkpoint Ledger",
+                checkpoint_rows,
+                caption="Current checkpoint actions visible to the active district scope.",
+                limit=12,
+            )
+
+    with tabs[1]:
+        chat_left, chat_right = st.columns([1.18, 0.82])
+        with chat_left:
+            if selected_room and to_int(selected_room_row.get("unread_count")) > 0:
+                if st.button("Mark thread as read", use_container_width=True, key="war_room_mark_read"):
+                    run_action_and_refresh(
+                        "/internal-comms/mark-read",
+                        payload={"room_name": selected_room},
+                        success_message="Thread marked as read.",
+                    )
+            render_message_feed(message_rows, empty_message="No war-room traffic has been posted yet.")
+        with chat_right:
+            with st.form("war_room_message_form"):
+                channel_scope = st.selectbox("Channel scope", ["statewide", "district", "direct", "case"], index=1 if district_scope != DEFAULT_DISTRICT_SCOPE else 0)
+                recipient_choices = ["None"] + [str(row.get("username")) for row in presence_rows if str(row.get("username")) != str(me_payload.get("username") or st.session_state.get("username"))]
+                recipient_username = st.selectbox("Direct recipient", recipient_choices, index=0, disabled=channel_scope != "direct")
+                priority = st.selectbox("Priority", ["routine", "medium", "high", "critical"], index=1)
+                ack_required = st.checkbox("Acknowledge required", value=True)
+                message_text = st.text_area("Post to war-room thread", height=130)
+                if st.form_submit_button("Post message", use_container_width=True):
+                    payload = {
+                        "room_name": selected_room or "State Command Net",
+                        "message_text": message_text,
+                        "channel_scope": channel_scope,
+                        "district": district_param if channel_scope in {"district", "case"} else None,
+                        "recipient_username": None if recipient_username == "None" or channel_scope != "direct" else recipient_username,
+                        "priority": priority,
+                        "ack_required": ack_required,
+                        "case_id": selected_case_id if channel_scope == "case" else None,
+                    }
+                    run_action_and_refresh("/internal-comms/messages", payload=payload, success_message="War-room message posted.")
+
+    with tabs[2]:
+        planner_left, planner_right = st.columns([1.08, 0.92])
+        with planner_left:
+            render_geo_html(
+                build_operational_polygon_svg(
+                    "Checkpoint Planner Map",
+                    "Operational GIS sectors and checkpoint diamonds for the current war-room scope.",
+                    district_rows,
+                    checkpoint_rows,
+                    selected_district=None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope,
+                    link_getter=lambda row: build_query_url({"ops_district": row.get("district")}),
+                ),
+                height=880,
+            )
+        with planner_right:
+            render_table(
+                "Route Registry",
+                route_rows,
+                caption="Available suspect and vehicle routes that can be tied to checkpoint actions.",
+                limit=18,
+            )
+            with st.form("war_room_checkpoint_form"):
+                checkpoint_name = st.text_input("Checkpoint name")
+                checkpoint_type = st.selectbox("Checkpoint type", ["vehicle_intercept", "device_screening", "perimeter_lock", "patrol_gate"], index=0)
+                selected_route_label = st.selectbox("Linked route", ["None"] + list(route_option_map.keys()), index=0)
+                status = st.selectbox("Status", ["planned", "active", "deployed", "completed"], index=0)
+                assigned_unit = st.text_input("Assigned unit")
+                district_value = st.text_input("District", value="" if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope)
+                lat_value = st.text_input("Latitude")
+                lon_value = st.text_input("Longitude")
+                notes = st.text_area("Checkpoint notes", height=110)
+                if st.form_submit_button("Create war-room checkpoint", use_container_width=True):
+                    payload = {
+                        "district": district_value,
+                        "checkpoint_name": checkpoint_name,
+                        "checkpoint_type": checkpoint_type,
+                        "route_ref": None if selected_route_label == "None" else route_option_map.get(selected_route_label),
+                        "status": status,
+                        "assigned_unit": assigned_unit or None,
+                        "latitude": to_float(lat_value) if str(lat_value).strip() else None,
+                        "longitude": to_float(lon_value) if str(lon_value).strip() else None,
+                        "case_id": selected_case_id,
+                        "notes": notes or None,
+                    }
+                    run_action_and_refresh("/checkpoint-plans", payload=payload, success_message="Checkpoint action created.")
 
 
 def render_fusion_center(district_scope: str, selected_case_id: int | None) -> None:
@@ -3391,9 +4118,11 @@ with st.sidebar:
         [
             "Mission Control",
             "Geo Command",
+            "Graph Fabric",
             "Fusion Center",
             "Case Dossier",
             "District Command",
+            "War Room",
             "Watchlists and Alerts",
             "Department Comms",
             "Tasking and Exports",
@@ -3411,12 +4140,16 @@ if workspace == "Mission Control":
     render_mission_control(district_scope, current_role)
 elif workspace == "Geo Command":
     render_geo_command(district_scope)
+elif workspace == "Graph Fabric":
+    render_graph_fabric(district_scope, selected_case_id)
 elif workspace == "Fusion Center":
     render_fusion_center(district_scope, selected_case_id)
 elif workspace == "Case Dossier":
     render_case_dossier(selected_case_id)
 elif workspace == "District Command":
     render_district_command(district_scope, me_payload, case_rows)
+elif workspace == "War Room":
+    render_war_room(district_scope, selected_case_id, me_payload)
 elif workspace == "Watchlists and Alerts":
     render_watchlists_and_alerts(district_scope, selected_case_id)
 elif workspace == "Department Comms":

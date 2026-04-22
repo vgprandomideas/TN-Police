@@ -341,6 +341,14 @@ class DepartmentMessage(Base):
     case_id = Column(Integer, ForeignKey("cases.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class DepartmentMessageRead(Base):
+    __tablename__ = "department_message_reads"
+    id = Column(Integer, primary_key=True)
+    username = Column(String(80), nullable=False)
+    room_name = Column(String(120), nullable=False)
+    last_read_message_id = Column(Integer, nullable=False, default=0)
+    read_at = Column(DateTime, default=datetime.utcnow)
+
 class GraphSnapshot(Base):
     __tablename__ = "graph_snapshots"
     id = Column(Integer, primary_key=True)

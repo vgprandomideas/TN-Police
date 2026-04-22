@@ -53,3 +53,8 @@ class DepartmentMessageCreate(BaseModel):
     priority: str = "routine"
     ack_required: bool = False
     case_id: int | None = None
+
+
+class DepartmentMessageReadCreate(BaseModel):
+    room_name: str
+    last_read_message_id: int | None = None

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 import csv
+from itertools import combinations
 import json
 import os
 from html import escape
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse
+from typing import Any, Callable
+from urllib.parse import urlencode, urlparse
 
 import requests
 import streamlit as st
@@ -218,6 +219,19 @@ def apply_theme() -> None:
             text-transform: uppercase;
             font-size: 0.74rem;
         }
+
+        .tn-room-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.45rem;
+            border-radius: 999px;
+            padding: 0.24rem 0.6rem;
+            background: rgba(118, 183, 255, 0.12);
+            color: #d9e9ff;
+            border: 1px solid rgba(118, 183, 255, 0.2);
+            font-size: 0.78rem;
+            margin-left: 0.55rem;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -356,6 +370,51 @@ def compact_params(params: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def get_query_param(name: str) -> str | None:
+    try:
+        value = st.query_params.get(name)
+    except Exception:
+        return None
+    if isinstance(value, list):
+        return str(value[0]) if value else None
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def set_query_param(name: str, value: str | None) -> None:
+    try:
+        current_value = get_query_param(name)
+        if value in (None, ""):
+            if current_value is not None:
+                del st.query_params[name]
+            return
+        if current_value != str(value):
+            st.query_params[name] = str(value)
+    except Exception:
+        return
+
+
+def build_query_url(updates: dict[str, Any]) -> str:
+    query_map: dict[str, str] = {}
+    try:
+        for key in st.query_params:
+            value = st.query_params.get(key)
+            if value not in (None, ""):
+                query_map[str(key)] = str(value)
+    except Exception:
+        query_map = {}
+
+    for key, value in updates.items():
+        if value in (None, ""):
+            query_map.pop(key, None)
+        else:
+            query_map[key] = str(value)
+
+    encoded = urlencode(query_map)
+    return f"?{encoded}" if encoded else "?"
+
+
 def to_int(value: Any, default: int = 0) -> int:
     try:
         return int(float(value))
@@ -457,6 +516,7 @@ def build_geo_svg(
     coverage_key: str | None = None,
     label_stride: int = 1,
     show_labels: bool = True,
+    link_getter: Callable[[dict[str, Any]], str | None] | None = None,
 ) -> str:
     width = 980
     padding = 70
@@ -521,15 +581,26 @@ def build_geo_svg(
                 'style="fill:#eaf2ff;font-size:11px;font-family:system-ui,sans-serif;font-weight:600;">'
                 f"{escape(label)}</text>"
             )
-        point_markup.append(
-            f"""
-            <g>
+        point_body = f"""
                 {coverage_markup}
                 <circle cx="{x:.1f}" cy="{y:.1f}" r="{radius:.1f}" fill="{fill}" fill-opacity="0.88"
                     stroke="{stroke}" stroke-width="{stroke_width}">
                     <title>{escape(tooltip)}</title>
                 </circle>
                 {label_markup}
+        """
+        if link_getter:
+            point_url = link_getter(row)
+            if point_url:
+                point_body = (
+                    f'<a href="{escape(point_url, quote=True)}" target="_top" style="cursor:pointer;text-decoration:none;">'
+                    f"{point_body}"
+                    "</a>"
+                )
+        point_markup.append(
+            f"""
+            <g>
+                {point_body}
             </g>
             """
         )
@@ -557,7 +628,209 @@ def render_geo_html(markup: str, height: int) -> None:
     if markup.strip().startswith('<div class="tn-inline-note">'):
         st.markdown(markup, unsafe_allow_html=True)
         return
+    if hasattr(st, "html"):
+        try:
+            st.html(markup)
+            return
+        except Exception:
+            pass
     components.html(markup, height=height, scrolling=False)
+
+
+def build_flow_svg(
+    title: str,
+    subtitle: str,
+    district_rows: list[dict[str, Any]],
+    flow_rows: list[dict[str, Any]],
+    selected_district: str | None = None,
+    link_getter: Callable[[dict[str, Any]], str | None] | None = None,
+) -> str:
+    width = 980
+    height = 760
+    padding = 70
+    if not district_rows:
+        return '<div class="tn-inline-note">District flow data is not available for the current selection.</div>'
+
+    district_lookup = {str(row.get("district")): row for row in district_rows if row.get("district")}
+    all_lons = [coord[0] for coord in TN_STATE_OUTLINE] + [to_float(row.get("longitude")) for row in district_rows]
+    all_lats = [coord[1] for coord in TN_STATE_OUTLINE] + [to_float(row.get("latitude")) for row in district_rows]
+    min_lon, max_lon = min(all_lons), max(all_lons)
+    min_lat, max_lat = min(all_lats), max(all_lats)
+
+    outline_points = []
+    for lon, lat in TN_STATE_OUTLINE:
+        x, y = project_geo_point(lon, lat, min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        outline_points.append(f"{x:.1f},{y:.1f}")
+    outline_markup = " ".join(outline_points)
+
+    max_weight = max((to_float(row.get("flow_weight")) for row in flow_rows), default=1.0)
+    flow_markup: list[str] = []
+    for row in flow_rows:
+        source = district_lookup.get(str(row.get("source_district")))
+        target = district_lookup.get(str(row.get("target_district")))
+        if not source or not target:
+            continue
+        x1, y1 = project_geo_point(to_float(source.get("longitude")), to_float(source.get("latitude")), min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        x2, y2 = project_geo_point(to_float(target.get("longitude")), to_float(target.get("latitude")), min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        weight = to_float(row.get("flow_weight"))
+        ratio = weight / max(max_weight, 1.0)
+        stroke_width = 1.6 + (ratio * 6.5)
+        highlighted = selected_district and selected_district in {row.get("source_district"), row.get("target_district")}
+        stroke = "rgba(255, 140, 66, 0.82)" if highlighted else "rgba(118, 183, 255, 0.38)"
+        tooltip = (
+            f"{row.get('source_district')} -> {row.get('target_district')} | "
+            f"Flow weight: {row.get('flow_weight')} | Clusters: {row.get('cluster_count')} | Cases: {row.get('case_count')}"
+        )
+        flow_markup.append(
+            f"""
+            <line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"
+                stroke="{stroke}" stroke-width="{stroke_width:.1f}" stroke-linecap="round">
+                <title>{escape(tooltip)}</title>
+            </line>
+            """
+        )
+
+    point_markup: list[str] = []
+    max_intensity = max((to_float(row.get("intensity")) for row in district_rows), default=1.0)
+    for row in district_rows:
+        label = str(row.get("district") or "Unknown")
+        x, y = project_geo_point(to_float(row.get("longitude")), to_float(row.get("latitude")), min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        intensity = to_float(row.get("intensity"))
+        ratio = intensity / max(max_intensity, 1.0)
+        radius = 7 + (ratio * 12)
+        stroke = "#ffe2bf" if selected_district and label == selected_district else "#d8e6ff"
+        point_body = (
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{radius:.1f}" fill="{interpolate_color((71, 122, 199), (255, 140, 66), ratio)}" '
+            f'fill-opacity="0.92" stroke="{stroke}" stroke-width="2.2"><title>{escape(label)}</title></circle>'
+            f'<text x="{x:.1f}" y="{(y - radius - 7):.1f}" text-anchor="middle" '
+            'style="fill:#eaf2ff;font-size:11px;font-family:system-ui,sans-serif;font-weight:600;">'
+            f"{escape(label)}</text>"
+        )
+        if link_getter:
+            point_url = link_getter(row)
+            if point_url:
+                point_body = (
+                    f'<a href="{escape(point_url, quote=True)}" target="_top" style="cursor:pointer;text-decoration:none;">'
+                    f"{point_body}</a>"
+                )
+        point_markup.append(f"<g>{point_body}</g>")
+
+    return f"""
+    <div style="border:1px solid rgba(92,116,151,0.35);border-radius:24px;padding:1rem 1rem 0.7rem 1rem;
+        background:linear-gradient(180deg, rgba(15,25,40,0.98), rgba(10,18,28,0.96));">
+        <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:1rem;flex-wrap:wrap;">
+            <div>
+                <div style="color:#76b7ff;font-size:0.82rem;letter-spacing:0.12em;text-transform:uppercase;font-weight:700;">{escape(title)}</div>
+                <div style="color:#97a8c4;font-size:0.95rem;margin-top:0.25rem;">{escape(subtitle)}</div>
+            </div>
+            <div style="color:#97a8c4;font-size:0.82rem;">Click district nodes to pin drill-down. Hover flow lines for movement details.</div>
+        </div>
+        <svg viewBox="0 0 {width} {height}" style="width:100%;height:auto;margin-top:0.8rem;">
+            <polygon points="{outline_markup}" fill="rgba(118,183,255,0.04)"
+                stroke="rgba(118,183,255,0.35)" stroke-width="3" />
+            {"".join(flow_markup)}
+            {"".join(point_markup)}
+        </svg>
+    </div>
+    """
+
+
+def build_route_svg(
+    title: str,
+    subtitle: str,
+    district_rows: list[dict[str, Any]],
+    route_rows: list[dict[str, Any]],
+    selected_route_id: str | None = None,
+    selected_district: str | None = None,
+    link_getter: Callable[[dict[str, Any]], str | None] | None = None,
+) -> str:
+    width = 980
+    height = 760
+    padding = 70
+    if not district_rows:
+        return '<div class="tn-inline-note">Route overlay data is not available for the current selection.</div>'
+
+    district_lookup = {str(row.get("district")): row for row in district_rows if row.get("district")}
+    all_lons = [coord[0] for coord in TN_STATE_OUTLINE] + [to_float(row.get("longitude")) for row in district_rows]
+    all_lats = [coord[1] for coord in TN_STATE_OUTLINE] + [to_float(row.get("latitude")) for row in district_rows]
+    min_lon, max_lon = min(all_lons), max(all_lons)
+    min_lat, max_lat = min(all_lats), max(all_lats)
+
+    outline_points = []
+    for lon, lat in TN_STATE_OUTLINE:
+        x, y = project_geo_point(lon, lat, min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        outline_points.append(f"{x:.1f},{y:.1f}")
+    outline_markup = " ".join(outline_points)
+
+    route_markup: list[str] = []
+    route_color_map = {"suspect": "#ff8c42", "vehicle": "#6bc7ff"}
+    for row in route_rows:
+        if selected_route_id and row.get("route_id") != selected_route_id:
+            continue
+        points = []
+        for district in row.get("districts") or []:
+            district_row = district_lookup.get(str(district))
+            if not district_row:
+                continue
+            x, y = project_geo_point(to_float(district_row.get("longitude")), to_float(district_row.get("latitude")), min_lon, max_lon, min_lat, max_lat, width, height, padding)
+            points.append((x, y, district))
+        if len(points) < 2:
+            continue
+        polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y, _ in points)
+        route_type = str(row.get("route_type") or "suspect")
+        color = route_color_map.get(route_type, "#ff8c42")
+        width_scale = 2.0 + (to_float(row.get("risk_score")) / 8.0)
+        tooltip = f"{row.get('subject_label')} | {' -> '.join(str(d) for d in row.get('districts', []))} | Risk: {row.get('risk_score')}"
+        route_markup.append(
+            f"""
+            <g>
+                <polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="{width_scale:.1f}"
+                    stroke-linecap="round" stroke-linejoin="round" opacity="0.82">
+                    <title>{escape(tooltip)}</title>
+                </polyline>
+                {''.join(
+                    f'<circle cx="{x:.1f}" cy="{y:.1f}" r="6.2" fill="{color}" stroke="#f8fbff" stroke-width="1.2"></circle>'
+                    for x, y, _ in points
+                )}
+            </g>
+            """
+        )
+
+    point_markup: list[str] = []
+    for row in district_rows:
+        label = str(row.get("district") or "Unknown")
+        x, y = project_geo_point(to_float(row.get("longitude")), to_float(row.get("latitude")), min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        point_stroke = "#ffe2bf" if selected_district and label == selected_district else "#8cbcff"
+        point_body = (
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5.6" fill="rgba(118, 183, 255, 0.32)" stroke="{point_stroke}" stroke-width="1.4"></circle>'
+        )
+        if link_getter:
+            point_url = link_getter(row)
+            if point_url:
+                point_body = (
+                    f'<a href="{escape(point_url, quote=True)}" target="_top" style="cursor:pointer;text-decoration:none;">'
+                    f"{point_body}</a>"
+                )
+        point_markup.append(f"<g>{point_body}</g>")
+
+    return f"""
+    <div style="border:1px solid rgba(92,116,151,0.35);border-radius:24px;padding:1rem 1rem 0.7rem 1rem;
+        background:linear-gradient(180deg, rgba(15,25,40,0.98), rgba(10,18,28,0.96));">
+        <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:1rem;flex-wrap:wrap;">
+            <div>
+                <div style="color:#76b7ff;font-size:0.82rem;letter-spacing:0.12em;text-transform:uppercase;font-weight:700;">{escape(title)}</div>
+                <div style="color:#97a8c4;font-size:0.95rem;margin-top:0.25rem;">{escape(subtitle)}</div>
+            </div>
+            <div style="color:#97a8c4;font-size:0.82rem;">Suspect tracks are orange. Vehicle corridors are blue.</div>
+        </div>
+        <svg viewBox="0 0 {width} {height}" style="width:100%;height:auto;margin-top:0.8rem;">
+            <polygon points="{outline_markup}" fill="rgba(118,183,255,0.04)"
+                stroke="rgba(118,183,255,0.35)" stroke-width="3" />
+            {"".join(route_markup)}
+            {"".join(point_markup)}
+        </svg>
+    </div>
+    """
 
 def scalarize(value: Any) -> Any:
     if value is None:
@@ -784,6 +1057,285 @@ def build_police_circle_rows(station_map_rows: list[dict[str, Any]]) -> list[dic
     return sorted(output, key=lambda item: to_float(item.get("lookout_radius_km")), reverse=True)
 
 
+def build_movement_flow_rows(
+    district_map_rows: list[dict[str, Any]],
+    cluster_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    district_lookup = {str(row.get("district")): row for row in district_map_rows if row.get("district")}
+    cluster_groups: dict[str, dict[str, Any]] = defaultdict(lambda: {"districts": set(), "cases": set(), "signal_sum": 0.0})
+    for row in cluster_rows:
+        cluster_id = str(row.get("cluster_id") or "").strip()
+        district = str(row.get("district") or "").strip()
+        if not cluster_id or district not in district_lookup:
+            continue
+        group = cluster_groups[cluster_id]
+        group["districts"].add(district)
+        if row.get("case_id") not in (None, "", "N/A"):
+            group["cases"].add(str(row.get("case_id")))
+        group["signal_sum"] += to_float(row.get("signal_strength"), 0.5)
+
+    flow_accumulator: dict[tuple[str, str], dict[str, Any]] = defaultdict(
+        lambda: {"flow_weight": 0.0, "cluster_count": 0, "cases": set()}
+    )
+    for payload in cluster_groups.values():
+        districts = sorted(payload["districts"])
+        if len(districts) < 2:
+            continue
+        base_signal = payload["signal_sum"] / max(len(districts), 1)
+        for source_district, target_district in combinations(districts, 2):
+            slot = flow_accumulator[(source_district, target_district)]
+            slot["flow_weight"] += base_signal + 0.65
+            slot["cluster_count"] += 1
+            slot["cases"].update(payload["cases"])
+
+    if not flow_accumulator:
+        ranked_districts = [
+            str(row.get("district"))
+            for row in sorted(district_map_rows, key=lambda item: to_float(item.get("intensity")), reverse=True)
+            if row.get("district")
+        ]
+        for index in range(max(0, len(ranked_districts) - 1)):
+            source_district = ranked_districts[index]
+            target_district = ranked_districts[index + 1]
+            flow_accumulator[(source_district, target_district)] = {
+                "flow_weight": 2.0 + (index * 0.4),
+                "cluster_count": 1,
+                "cases": set(),
+            }
+
+    output: list[dict[str, Any]] = []
+    for (source_district, target_district), payload in flow_accumulator.items():
+        source_row = district_lookup.get(source_district)
+        target_row = district_lookup.get(target_district)
+        if not source_row or not target_row:
+            continue
+        output.append(
+            {
+                "source_district": source_district,
+                "target_district": target_district,
+                "source_latitude": source_row.get("latitude"),
+                "source_longitude": source_row.get("longitude"),
+                "target_latitude": target_row.get("latitude"),
+                "target_longitude": target_row.get("longitude"),
+                "flow_weight": round(to_float(payload.get("flow_weight")), 2),
+                "cluster_count": to_int(payload.get("cluster_count")),
+                "case_count": len(payload.get("cases", set())),
+                "flow_type": "cross-district linkage",
+            }
+        )
+    return sorted(output, key=lambda item: to_float(item.get("flow_weight")), reverse=True)
+
+
+def build_camera_registry_rows(station_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for index, row in enumerate(station_rows, start=1):
+        district_code = str(row.get("district") or "TN")[:3].upper()
+        station_code = str(row.get("station_name") or "NODE").split()[0][:4].upper()
+        blind_risk = str(row.get("blind_spot_risk") or "Moderate")
+        status = "monitoring"
+        if blind_risk == "High":
+            status = "priority_watch"
+        elif blind_risk == "Low":
+            status = "stable"
+        profiles = [
+            ("PTZ perimeter", "ptz", 0.42),
+            ("ANPR corridor", "anpr", 0.33),
+            ("Command overwatch" if str(row.get("station_type")) == "Central" else "Digital ingress", "fixed_dome", 0.25),
+        ]
+        for profile_index, (zone_label, camera_type, weight) in enumerate(profiles, start=1):
+            blind_spot_score = round(
+                (to_float(row.get("intensity")) * 0.95)
+                + (to_float(row.get("avg_anomaly")) * 7.0)
+                + (to_int(row.get("incident_count")) * 0.28)
+                + (weight * 4.2),
+                2,
+            )
+            output.append(
+                {
+                    "camera_id": f"{district_code}-{station_code}-{index:02d}-{profile_index}",
+                    "district": row.get("district"),
+                    "station_name": row.get("station_name"),
+                    "camera_type": camera_type,
+                    "zone_label": zone_label,
+                    "blind_spot_score": blind_spot_score,
+                    "coverage_circle_km": row.get("coverage_circle_km"),
+                    "retention_profile": "90 days" if blind_spot_score >= 12 else "60 days",
+                    "feed_status": status,
+                    "priority_band": blind_risk,
+                }
+            )
+    return sorted(output, key=lambda item: to_float(item.get("blind_spot_score")), reverse=True)
+
+
+def build_blind_spot_rows(
+    station_rows: list[dict[str, Any]],
+    patrol_rows: list[dict[str, Any]],
+    geofence_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    patrol_lookup: dict[int, list[float]] = defaultdict(list)
+    district_geofence_count: dict[str, int] = defaultdict(int)
+    for row in patrol_rows:
+        station_id = to_optional_int(str(row.get("station_id", "")))
+        if station_id is not None:
+            patrol_lookup[station_id].append(to_float(row.get("coverage_ratio"), 0.65))
+    for row in geofence_rows:
+        district = str(row.get("district") or "")
+        if district:
+            district_geofence_count[district] += 1
+
+    output: list[dict[str, Any]] = []
+    for row in station_rows:
+        station_id = to_optional_int(str(row.get("station_id", "")))
+        coverage_ratio = 0.65
+        if station_id is not None and patrol_lookup.get(station_id):
+            coverage_ratio = min(patrol_lookup[station_id])
+        district = str(row.get("district") or "")
+        blind_spot_score = round(
+            ((1 - coverage_ratio) * 10.5)
+            + (to_float(row.get("avg_anomaly")) * 6.4)
+            + (to_float(row.get("intensity")) * 0.92)
+            + (district_geofence_count.get(district, 0) * 0.42),
+            2,
+        )
+        output.append(
+            {
+                "district": district,
+                "station_name": row.get("station_name"),
+                "station_type": row.get("station_type"),
+                "latitude": row.get("latitude"),
+                "longitude": row.get("longitude"),
+                "intensity": row.get("intensity"),
+                "incident_count": row.get("incident_count"),
+                "coverage_gap_pct": round((1 - coverage_ratio) * 100, 1),
+                "blind_spot_score": blind_spot_score,
+                "recommended_action": "Deploy mobile mast and PTZ corridor watch" if blind_spot_score >= 12 else "Rebalance patrol and ANPR coverage" if blind_spot_score >= 8 else "Maintain current camera posture",
+            }
+        )
+    return sorted(output, key=lambda item: to_float(item.get("blind_spot_score")), reverse=True)
+
+
+def build_route_rows(
+    district_map_rows: list[dict[str, Any]],
+    flow_rows: list[dict[str, Any]],
+    suspect_rows: list[dict[str, Any]],
+    case_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    district_lookup = {str(row.get("district")): row for row in district_map_rows if row.get("district")}
+    adjacency: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    for row in flow_rows:
+        source = str(row.get("source_district") or "")
+        target = str(row.get("target_district") or "")
+        weight = to_float(row.get("flow_weight"), 0.0)
+        if source and target:
+            adjacency[source].append((target, weight))
+            adjacency[target].append((source, weight))
+
+    for district in adjacency:
+        adjacency[district] = sorted(adjacency[district], key=lambda item: item[1], reverse=True)
+
+    intensity_rank = [
+        str(row.get("district"))
+        for row in sorted(district_map_rows, key=lambda item: to_float(item.get("intensity")), reverse=True)
+        if row.get("district")
+    ]
+
+    def pick_targets(origin: str, limit: int = 2) -> list[str]:
+        targets = [target for target, _ in adjacency.get(origin, []) if target != origin]
+        if len(targets) < limit:
+            targets.extend([district for district in intensity_rank if district not in {origin, *targets}])
+        return targets[:limit]
+
+    threat_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    route_rows: list[dict[str, Any]] = []
+    sorted_suspects = sorted(
+        suspect_rows,
+        key=lambda row: (
+            threat_rank.get(str(row.get("threat_level") or "").lower(), 0),
+            to_int(row.get("open_alerts")),
+            to_int(row.get("linked_cases")),
+        ),
+        reverse=True,
+    )
+    for row in sorted_suspects[:4]:
+        origin = str(row.get("district") or "")
+        if origin not in district_lookup:
+            continue
+        districts = [origin] + pick_targets(origin)
+        route_rows.append(
+            {
+                "route_id": f"suspect-{row.get('id')}",
+                "route_type": "suspect",
+                "subject_label": f"Suspect trail | {row.get('category') or 'fusion target'}",
+                "districts": districts,
+                "risk_score": round((threat_rank.get(str(row.get("threat_level") or "").lower(), 1) * 4.8) + to_int(row.get("open_alerts")) + (to_int(row.get("linked_cases")) * 0.7), 2),
+                "status": "active watch",
+                "last_seen": f"{origin} sector",
+            }
+        )
+
+    priority_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    sorted_cases = sorted(
+        case_rows,
+        key=lambda row: priority_rank.get(str(row.get("priority") or "medium").lower(), 0),
+        reverse=True,
+    )
+    for row in sorted_cases[:3]:
+        origin = str(row.get("district") or "")
+        if origin not in district_lookup:
+            continue
+        districts = [origin] + pick_targets(origin)
+        route_rows.append(
+            {
+                "route_id": f"vehicle-{row.get('id')}",
+                "route_type": "vehicle",
+                "subject_label": f"Vehicle corridor | Case {row.get('id')}",
+                "districts": districts,
+                "risk_score": round((priority_rank.get(str(row.get("priority") or "").lower(), 1) * 4.0) + len(districts), 2),
+                "status": "route monitor",
+                "last_seen": f"Case district {origin}",
+            }
+        )
+
+    return route_rows
+
+
+def build_incident_playback_rows(
+    incident_rows: list[dict[str, Any]],
+    station_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    station_lookup = {
+        to_optional_int(str(row.get("station_id", ""))): row
+        for row in station_rows
+        if to_optional_int(str(row.get("station_id", ""))) is not None
+    }
+    ordered_rows = sorted(incident_rows, key=lambda row: str(row.get("created_at") or ""))
+    output: list[dict[str, Any]] = []
+    for index, row in enumerate(ordered_rows, start=1):
+        station_row = station_lookup.get(to_optional_int(str(row.get("station_id", ""))), {})
+        latitude = station_row.get("latitude")
+        longitude = station_row.get("longitude")
+        if latitude in (None, "", "N/A") or longitude in (None, "", "N/A"):
+            continue
+        output.append(
+            {
+                "sequence": index,
+                "sequence_label": f"T{index}",
+                "incident_id": row.get("id"),
+                "district": row.get("district"),
+                "station_name": station_row.get("station_name") or f"Station {row.get('station_id')}",
+                "category": row.get("category"),
+                "severity": row.get("severity"),
+                "anomaly_score": row.get("anomaly_score"),
+                "status": row.get("status"),
+                "created_at": row.get("created_at"),
+                "latitude": latitude,
+                "longitude": longitude,
+                "intensity": round(to_int(row.get("severity")) + (to_float(row.get("anomaly_score")) * 4.0), 2),
+            }
+        )
+    return output
+
+
 def summarize_comms_rooms(message_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for row in message_rows:
@@ -817,6 +1369,9 @@ def render_message_feed(rows: list[dict[str, Any]], empty_message: str = "No coo
     for row in rows:
         priority = str(row.get("priority") or "routine")
         recipient = row.get("recipient_username") or row.get("room_name") or "broadcast"
+        unread_markup = ""
+        if bool(row.get("is_unread")):
+            unread_markup = '<span class="tn-room-pill">Unread</span>'
         meta = " | ".join(
             part for part in [
                 f"{row.get('sender_username', 'unknown')} -> {recipient}",
@@ -830,7 +1385,7 @@ def render_message_feed(rows: list[dict[str, Any]], empty_message: str = "No coo
         st.markdown(
             f"""
             <div class="tn-message-card">
-                <div class="tn-message-priority">{escape(priority)}</div>
+                <div class="tn-message-priority">{escape(priority)} {unread_markup}</div>
                 <div class="tn-message-meta">{escape(meta)}</div>
                 <div>{body}</div>
             </div>
@@ -1215,16 +1770,16 @@ def render_mission_control(district_scope: str, current_role: str) -> None:
 def render_geo_command(district_scope: str) -> None:
     render_hero(
         "Geo Command",
-        "Statewide Tamil Nadu district visibility, CCTV deployment planning, and police-station lookout circles aligned in one geospatial command surface.",
+        "Statewide Tamil Nadu district visibility, live operational overlays, route tracking, CCTV planning, and station lookout circles aligned in one command surface.",
         eyebrow="Statewide Geospatial Intelligence",
         chips=[
             "Visible to every logged-in role",
             "All 38 Tamil Nadu districts",
-            "CCTV and station-circle overlays",
+            "Flows, routes, CCTV, playback",
         ],
     )
     render_inline_note(
-        "Statewide district visibility is available to all authenticated users. Use the district detail lens to inspect station concentration, CCTV reinforcement options, and police-station lookout circles."
+        "Statewide district visibility is available to all authenticated users. Click district nodes where supported to pin the drill-down lens, then inspect flows, routes, CCTV posture, blind spots, and incident playback."
     )
 
     control_left, control_mid, control_right = st.columns([1.1, 0.9, 1.0])
@@ -1251,6 +1806,10 @@ def render_geo_command(district_scope: str) -> None:
     statewide_station_map_rows = build_station_map_rows(statewide_station_heatmap_rows, DEFAULT_DISTRICT_SCOPE)
 
     available_districts = [str(row.get("district")) for row in district_map_rows if row.get("district")]
+    query_district = get_query_param("ops_district")
+    if query_district in available_districts and st.session_state.get("geo_detail_district") != query_district:
+        st.session_state.geo_detail_district = query_district
+
     if district_scope != DEFAULT_DISTRICT_SCOPE and district_scope in available_districts:
         detail_district = district_scope
         st.caption(f"District detail is pinned to `{district_scope}` by your current workspace scope.")
@@ -1259,6 +1818,8 @@ def render_geo_command(district_scope: str) -> None:
         if district_heatmap_rows:
             top_row = max(district_heatmap_rows, key=lambda row: to_float(row.get("intensity")))
             default_district = str(top_row.get("district") or "")
+        if query_district in available_districts:
+            default_district = query_district
         if not default_district and available_districts:
             default_district = available_districts[0]
         detail_district = st.selectbox(
@@ -1267,6 +1828,10 @@ def render_geo_command(district_scope: str) -> None:
             index=available_districts.index(default_district) if default_district in available_districts else 0,
             key="geo_detail_district",
         ) if available_districts else None
+    set_query_param("ops_district", detail_district)
+
+    district_link_getter = lambda row: build_query_url({"ops_district": row.get("district")})
+    station_link_getter = lambda row: build_query_url({"ops_district": row.get("district")})
 
     station_heatmap_result = api_get(
         "/geo/station-heatmap",
@@ -1294,6 +1859,9 @@ def render_geo_command(district_scope: str) -> None:
     detail_patrol_rows = rows_from_result(
         api_get("/patrol-coverage", params=compact_params({"district": detail_district}) or None)
     )
+    cluster_rows = rows_from_result(api_get("/fusion/clusters"))
+    suspect_rows = rows_from_result(api_get("/suspect-dossiers"))
+    scoped_case_rows = rows_from_result(api_get("/cases"))
 
     selected_district_map_rows = build_district_map_rows(district_heatmap_rows, selected_district=detail_district)
     cctv_district_rows = build_cctv_district_rows(
@@ -1302,9 +1870,37 @@ def render_geo_command(district_scope: str) -> None:
         statewide_hotspot_rows,
         statewide_patrol_rows,
     )
+    statewide_cctv_station_rows = build_cctv_station_rows(statewide_station_map_rows)
     cctv_station_rows = build_cctv_station_rows(station_map_rows)
     statewide_circle_rows = build_police_circle_rows(statewide_station_map_rows)
     detail_circle_rows = build_police_circle_rows(station_map_rows)
+    movement_flow_rows = build_movement_flow_rows(district_map_rows, cluster_rows)
+    focused_flow_rows = [
+        row for row in movement_flow_rows
+        if detail_district in {row.get("source_district"), row.get("target_district")}
+    ] or movement_flow_rows[:12]
+    route_rows = build_route_rows(district_map_rows, movement_flow_rows, suspect_rows, scoped_case_rows)
+    route_rows = [
+        row for row in route_rows
+        if not detail_district or detail_district in set(str(item) for item in row.get("districts", []))
+    ] or build_route_rows(district_map_rows, movement_flow_rows[:12], suspect_rows, scoped_case_rows)
+    route_option_map = {f"{row.get('subject_label')} | {row.get('route_type')}": str(row.get("route_id")) for row in route_rows}
+    query_route = get_query_param("ops_route")
+    if query_route and route_rows and st.session_state.get("geo_route_id") != query_route:
+        st.session_state.geo_route_id = query_route
+    selected_route_id = None
+    if route_option_map:
+        reverse_option_map = {value: key for key, value in route_option_map.items()}
+        default_route_label = reverse_option_map.get(query_route) or next(iter(route_option_map))
+        selected_route_label = st.selectbox("Tracked route overlay", list(route_option_map.keys()), index=list(route_option_map.keys()).index(default_route_label), key="geo_selected_route")
+        selected_route_id = route_option_map.get(selected_route_label)
+        set_query_param("ops_route", selected_route_id)
+    statewide_blind_spot_rows = build_blind_spot_rows(statewide_cctv_station_rows, statewide_patrol_rows, statewide_geofence_rows)
+    detail_blind_spot_rows = build_blind_spot_rows(cctv_station_rows, detail_patrol_rows, geofence_rows)
+    statewide_camera_registry_rows = build_camera_registry_rows(statewide_cctv_station_rows)
+    detail_camera_registry_rows = [row for row in statewide_camera_registry_rows if str(row.get("district")) == str(detail_district)]
+    playback_rows = build_incident_playback_rows(incident_rows, station_map_rows)
+
     total_incidents = sum(to_int(row.get("incident_count")) for row in district_map_rows)
     max_intensity = max((to_float(row.get("intensity")) for row in district_map_rows), default=0.0)
     active_geofences = sum(1 for row in geofence_rows if str(row.get("active")).lower() == "yes")
@@ -1312,6 +1908,8 @@ def render_geo_command(district_scope: str) -> None:
     render_metric_grid(
         [
             ("Districts Mapped", len(district_map_rows)),
+            ("Movement Flows", len(movement_flow_rows)),
+            ("Tracked Routes", len(route_rows)),
             ("Police Station Circles", len(statewide_circle_rows)),
             ("District Incidents", total_incidents),
             ("Peak District Intensity", round(max_intensity, 2)),
@@ -1324,7 +1922,7 @@ def render_geo_command(district_scope: str) -> None:
         ]
     )
 
-    tabs = st.tabs(["Situation", "CCTV Coverage", "Police Circles"])
+    tabs = st.tabs(["Situation", "Movement Flows", "CCTV Ops", "Police Circles", "Routes", "Timeline Playback"])
     with tabs[0]:
         map_left, map_right = st.columns([1.18, 0.82])
         with map_left:
@@ -1337,6 +1935,7 @@ def render_geo_command(district_scope: str) -> None:
                     selected_label=detail_district,
                     intensity_key="intensity",
                     value_key="incident_count",
+                    link_getter=district_link_getter,
                 ),
                 height=920,
             )
@@ -1356,6 +1955,7 @@ def render_geo_command(district_scope: str) -> None:
                         intensity_key="intensity",
                         value_key="incident_count",
                         height=700,
+                        link_getter=station_link_getter,
                     ),
                     height=830,
                 )
@@ -1404,7 +2004,38 @@ def render_geo_command(district_scope: str) -> None:
 
     with tabs[1]:
         render_inline_note(
-            "CCTV planning is derived from district intensity, anomaly load, hotspot forecasts, geofence zones, and patrol gaps. These are deployment recommendations rather than claims of live camera access."
+            "Cross-district movement flows are inferred from fusion-cluster overlap and case-linked convergence. Use them as movement hypotheses for operational coordination and interdiction planning."
+        )
+        flow_left, flow_right = st.columns([1.16, 0.84])
+        with flow_left:
+            render_geo_html(
+                build_flow_svg(
+                    "Tamil Nadu District-to-District Flow Map",
+                    "Flow weight indicates converging case, entity, and cluster movement pressure across districts.",
+                    selected_district_map_rows,
+                    movement_flow_rows[:18],
+                    selected_district=detail_district,
+                    link_getter=district_link_getter,
+                ),
+                height=920,
+            )
+        with flow_right:
+            render_table(
+                "Focused District Flows",
+                focused_flow_rows,
+                caption="Highest-weight district flows touching the active drill-down district.",
+                limit=14,
+            )
+            render_table(
+                "Fusion Cluster Members",
+                [row for row in cluster_rows if detail_district in {str(row.get('district'))}],
+                caption="Cluster members inside the current district lens.",
+                limit=14,
+            )
+
+    with tabs[2]:
+        render_inline_note(
+            "CCTV planning and blind-spot heatmaps are derived from district intensity, anomaly load, hotspot forecasts, patrol gaps, and geofence activity. These are deployment recommendations rather than claims of live camera access."
         )
         cctv_left, cctv_right = st.columns([1.14, 0.86])
         with cctv_left:
@@ -1418,26 +2049,28 @@ def render_geo_command(district_scope: str) -> None:
                     intensity_key="surveillance_score",
                     value_key="recommended_cameras",
                     coverage_key="recommended_cameras",
+                    link_getter=district_link_getter,
                 ),
                 height=920,
             )
         with cctv_right:
-            if cctv_station_rows:
+            if detail_blind_spot_rows:
                 render_geo_html(
                     build_geo_svg(
-                        "District CCTV Package Map",
-                        f"Recommended camera package and coverage ring for {detail_district}.",
-                        cctv_station_rows,
+                        "District Blind-Spot Heatmap",
+                        f"Blind-spot intensity and camera reinforcement zones for {detail_district}.",
+                        detail_blind_spot_rows,
                         point_label_key="station_name",
-                        intensity_key="intensity",
-                        value_key="recommended_cameras",
-                        coverage_key="coverage_circle_km",
+                        intensity_key="blind_spot_score",
+                        value_key="coverage_gap_pct",
+                        coverage_key="blind_spot_score",
                         height=700,
+                        link_getter=station_link_getter,
                     ),
                     height=830,
                 )
             else:
-                render_inline_note("District CCTV package planning appears once station activity is available in the selected district.")
+                render_inline_note("District blind-spot heatmap appears once station and patrol activity are available.")
 
         cctv_lower_left, cctv_lower_right = st.columns(2)
         with cctv_lower_left:
@@ -1447,15 +2080,27 @@ def render_geo_command(district_scope: str) -> None:
                 caption="District-level CCTV reinforcement options across Tamil Nadu, including PTZ, dome, ANPR, and mobile tower recommendations.",
                 limit=38,
             )
+            render_table(
+                "Camera Registry",
+                statewide_camera_registry_rows,
+                caption="Planned statewide camera registry entries, including device type, zone label, retention profile, and blind-spot priority.",
+                limit=30,
+            )
         with cctv_lower_right:
             render_table(
                 "District Camera Packages",
                 cctv_station_rows,
-                caption="Station-level packages for the selected district, including watch posture and blind-spot risk.",
+                caption="Station-level camera packages for the selected district, including watch posture and blind-spot risk.",
+                limit=20,
+            )
+            render_table(
+                "Blind-Spot Registry",
+                detail_blind_spot_rows,
+                caption="Blind-spot risk, coverage gap percentage, and recommended action by station inside the active district lens.",
                 limit=20,
             )
 
-    with tabs[2]:
+    with tabs[3]:
         render_inline_note(
             "Coverage circles represent lookout and response radii around police stations. They are operational watch zones, not exact legal jurisdiction boundaries."
         )
@@ -1472,6 +2117,7 @@ def render_geo_command(district_scope: str) -> None:
                     coverage_key="lookout_radius_km",
                     height=760,
                     label_stride=5,
+                    link_getter=station_link_getter,
                 ),
                 height=900,
             )
@@ -1487,6 +2133,7 @@ def render_geo_command(district_scope: str) -> None:
                         value_key="incident_count",
                         coverage_key="lookout_radius_km",
                         height=700,
+                        link_getter=station_link_getter,
                     ),
                     height=830,
                 )
@@ -1508,6 +2155,105 @@ def render_geo_command(district_scope: str) -> None:
                 caption="Lookout circles for the selected district.",
                 limit=20,
             )
+
+    with tabs[4]:
+        render_inline_note(
+            "Tracked routes combine district-to-district linkage pressure, suspect threat posture, and high-priority case corridors. Use the selected route overlay to inspect likely movement chains."
+        )
+        route_left, route_right = st.columns([1.14, 0.86])
+        with route_left:
+            render_geo_html(
+                build_route_svg(
+                    "Vehicle and Suspect Route Overlay",
+                    "Orange polylines represent suspect trails. Blue polylines represent vehicle-interest corridors.",
+                    selected_district_map_rows,
+                    route_rows,
+                    selected_route_id=selected_route_id,
+                    selected_district=detail_district,
+                    link_getter=district_link_getter,
+                ),
+                height=920,
+            )
+        with route_right:
+            selected_route_row = next((row for row in route_rows if str(row.get("route_id")) == str(selected_route_id)), route_rows[0] if route_rows else {})
+            render_metric_grid(
+                [
+                    ("Selected Route", selected_route_row.get("route_type", "N/A")),
+                    ("Risk Score", selected_route_row.get("risk_score", "N/A")),
+                    ("Stops", len(selected_route_row.get("districts", [])) if selected_route_row else 0),
+                ]
+            )
+            render_table(
+                "Route Registry",
+                route_rows,
+                caption="Tracked suspect and vehicle routes inferred from district linkages and case pressure.",
+                limit=20,
+            )
+            if selected_route_row:
+                render_table(
+                    "Selected Route Stops",
+                    [
+                        {
+                            "route_id": selected_route_row.get("route_id"),
+                            "subject_label": selected_route_row.get("subject_label"),
+                            "route_type": selected_route_row.get("route_type"),
+                            "stop_order": index + 1,
+                            "district": district_name,
+                        }
+                        for index, district_name in enumerate(selected_route_row.get("districts", []))
+                    ],
+                    caption="Ordered district stops for the selected route overlay.",
+                    limit=10,
+                )
+
+    with tabs[5]:
+        render_inline_note(
+            "Timeline playback reconstructs filtered incidents in chronological order. Slide through the sequence to see how the incident picture escalates across the selected district."
+        )
+        if playback_rows:
+            playback_max = len(playback_rows)
+            playback_step = st.slider("Playback step", 1, playback_max, playback_max, key="geo_playback_step")
+            visible_playback_rows = playback_rows[:playback_step]
+            current_playback_row = visible_playback_rows[-1]
+            playback_left, playback_right = st.columns([1.12, 0.88])
+            with playback_left:
+                render_geo_html(
+                    build_geo_svg(
+                        "Incident Timeline Playback",
+                        f"Sequence through {playback_max} incidents in {detail_district or 'the active district lens'}. Current focus is step {playback_step}.",
+                        visible_playback_rows,
+                        point_label_key="sequence_label",
+                        selected_label=str(current_playback_row.get("sequence_label")),
+                        intensity_key="intensity",
+                        value_key="severity",
+                        show_labels=False,
+                        label_stride=999,
+                    ),
+                    height=920,
+                )
+            with playback_right:
+                render_metric_grid(
+                    [
+                        ("Playback Step", playback_step),
+                        ("Current Category", current_playback_row.get("category", "N/A")),
+                        ("Current Severity", current_playback_row.get("severity", "N/A")),
+                        ("Current Station", current_playback_row.get("station_name", "N/A")),
+                    ]
+                )
+                render_table(
+                    "Current Incident Focus",
+                    [current_playback_row],
+                    caption="Current incident in the playback sequence.",
+                    limit=1,
+                )
+                render_table(
+                    "Playback Timeline",
+                    list(reversed(visible_playback_rows)),
+                    caption="Incidents revealed so far in the playback sequence.",
+                    limit=20,
+                )
+        else:
+            render_inline_note("No incident playback sequence is available for the active district and filter set.")
 
 
 def render_fusion_center(district_scope: str, selected_case_id: int | None) -> None:
@@ -2164,31 +2910,54 @@ def render_department_comms(
     district_param = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
     current_username = str(me_payload.get("username") or st.session_state.get("username") or "unknown")
     directory_rows = rows_from_result(api_get("/personnel/directory"))
+    room_rows = rows_from_result(
+        api_get(
+            "/internal-comms/rooms",
+            params=compact_params({"district": district_param}) or None,
+        )
+    )
+    available_rooms = [str(row.get("room_name")) for row in room_rows if row.get("room_name")]
+    query_room = get_query_param("ops_room")
+    if query_room in available_rooms and st.session_state.get("comms_room_selector") != query_room:
+        st.session_state.comms_room_selector = query_room
+    if available_rooms:
+        default_room = query_room if query_room in available_rooms else available_rooms[0]
+        selected_room = st.selectbox(
+            "Coordination room",
+            available_rooms,
+            index=available_rooms.index(default_room),
+            key="comms_room_selector",
+        )
+        set_query_param("ops_room", selected_room)
+    else:
+        selected_room = None
+
     message_rows = rows_from_result(
         api_get(
             "/internal-comms/messages",
             params=compact_params(
                 {
                     "district": district_param,
+                    "room_name": selected_room,
                     "recipient_username": current_username,
                 }
             ) or None,
         )
     )
-    room_rows = summarize_comms_rooms(message_rows)
-    available_rooms = sorted({str(row.get("room_name")) for row in room_rows if row.get("room_name")})
+    selected_room_row = next((row for row in room_rows if str(row.get("room_name")) == str(selected_room)), {})
+    unread_total = sum(to_int(row.get("unread_count")) for row in room_rows)
     direct_count = sum(1 for row in message_rows if row.get("recipient_username") not in (None, "", "N/A"))
     ack_required_count = sum(1 for row in message_rows if str(row.get("ack_required")).lower() == "yes")
 
     render_hero(
         "Department Comms",
-        "Operational coordination channels for statewide command, district rooms, case escalation, and direct personnel messaging.",
+        "Operational coordination channels for statewide command, district rooms, case escalation, and direct personnel messaging with live thread state.",
         eyebrow="Internal Coordination Fabric",
         chips=[
             f"User: {current_username}",
             f"District lens: {district_scope}",
             f"Rooms: {len(room_rows)}",
-            f"Messages: {len(message_rows)}",
+            f"Unread: {unread_total}",
         ],
     )
 
@@ -2197,6 +2966,7 @@ def render_department_comms(
             ("Personnel Visible", len(directory_rows)),
             ("Active Rooms", len(room_rows)),
             ("Messages Loaded", len(message_rows)),
+            ("Room Unread", selected_room_row.get("unread_count", 0)),
             ("Direct Messages", direct_count),
             ("Ack Required", ack_required_count),
             ("Case Lens", selected_case_id if selected_case_id is not None else "None"),
@@ -2225,12 +2995,19 @@ def render_department_comms(
     with tabs[0]:
         feed_left, feed_right = st.columns([1.18, 0.82])
         with feed_left:
+            if selected_room and to_int(selected_room_row.get("unread_count")) > 0:
+                if st.button("Mark selected room as read", use_container_width=True, key="comms_mark_read"):
+                    run_action_and_refresh(
+                        "/internal-comms/mark-read",
+                        payload={"room_name": selected_room},
+                        success_message="Room marked as read.",
+                    )
             render_message_feed(filtered_message_rows)
         with feed_right:
             render_table(
                 "Coordination Rooms",
                 room_rows,
-                caption="Current rooms, latest activity, and priority-message counts for the filtered comms surface.",
+                caption="Current rooms, latest activity, and unread-thread posture for the active comms surface.",
                 limit=12,
             )
             render_table(
@@ -2241,11 +3018,11 @@ def render_department_comms(
             )
 
     with tabs[1]:
-        room_choices = ["State Command Net", "Cyber Fusion Desk", "District Coordination", "Case Coordination", "Direct Coordination", "Custom Room"]
+        room_choices = available_rooms + [room for room in ["State Command Net", "Cyber Fusion Desk", "District Coordination", "Case Coordination", "Direct Coordination", "Custom Room"] if room not in available_rooms]
         recipient_choices = ["None"] + [str(row.get("username")) for row in directory_rows if row.get("username") != current_username]
         with st.form("department_comms_form"):
-            selected_room = st.selectbox("Room", room_choices, index=0)
-            custom_room = st.text_input("Custom room name", value="", disabled=selected_room != "Custom Room")
+            compose_room = st.selectbox("Room", room_choices, index=room_choices.index(selected_room) if selected_room in room_choices else 0)
+            custom_room = st.text_input("Custom room name", value="", disabled=compose_room != "Custom Room")
             channel_scope = st.selectbox("Channel scope", ["statewide", "district", "direct", "case"], index=0)
             compose_district = st.text_input(
                 "District",
@@ -2262,7 +3039,7 @@ def render_department_comms(
             ack_required = st.checkbox("Acknowledge required")
             message_text = st.text_area("Message", height=140, placeholder="Type the operational instruction, coordination note, or escalation context.")
             if st.form_submit_button("Send message", use_container_width=True):
-                room_name = custom_room.strip() if selected_room == "Custom Room" else selected_room
+                room_name = custom_room.strip() if compose_room == "Custom Room" else compose_room
                 payload = {
                     "room_name": room_name or "State Command Net",
                     "message_text": message_text,
@@ -2289,7 +3066,7 @@ def render_department_comms(
         render_table(
             "Room Registry",
             room_rows,
-            caption="Rooms currently in use, including latest sender, scope, and latest activity.",
+            caption="Rooms currently in use, including unread counts, latest sender, scope, and latest activity.",
             limit=20,
         )
 

@@ -10,7 +10,8 @@ from jose import jwt, JWTError
 from app.config import JWT_SECRET, JWT_ALGORITHM
 from app.schemas import (
     LoginRequest, ComplaintCreate, CaseCreate, CaseCommentCreate,
-    CaseAssignCreate, ComplaintCaseLinkCreate, WatchlistCreate, EvidenceCreate, DepartmentMessageCreate
+    CaseAssignCreate, ComplaintCaseLinkCreate, WatchlistCreate, EvidenceCreate,
+    DepartmentMessageCreate, DepartmentMessageReadCreate
 )
 from db.database import get_db
 from db.models import (
@@ -18,7 +19,7 @@ from db.models import (
     CaseComment, CaseAssignment, Incident, IngestQueue, ComplaintCaseLink, ConnectorRegistry,
     Watchlist, WatchlistHit, EvidenceAttachment, CaseTimelineEvent, StationRoutingRule,
     ProsecutionPacket, CustodyLog, MedicalCheckLog, EventCommandBoard,
-    DocumentIntake, ExtractedEntity, CourtHearing, PrisonMovement, NotificationEvent, DepartmentMessage, GraphSnapshot, GeoFenceAlert, AdapterStub, TaskQueue, TaskExecution, SuspectDossier, GraphInsight, CourtPacketExport, EvidenceIntegrityLog, NarrativeBrief, HotspotForecast, PatrolCoverageMetric, SimilarityHit, TimelineDigest, ExportJob, WarRoomSnapshot, ExplorationBookmark
+    DocumentIntake, ExtractedEntity, CourtHearing, PrisonMovement, NotificationEvent, DepartmentMessage, DepartmentMessageRead, GraphSnapshot, GeoFenceAlert, AdapterStub, TaskQueue, TaskExecution, SuspectDossier, GraphInsight, CourtPacketExport, EvidenceIntegrityLog, NarrativeBrief, HotspotForecast, PatrolCoverageMetric, SimilarityHit, TimelineDigest, ExportJob, WarRoomSnapshot, ExplorationBookmark
 )
 from services.auth import verify_password, create_access_token
 from services.permissions import (
@@ -576,6 +577,106 @@ def personnel_directory(user=Depends(current_user), db: Session = Depends(get_db
         )
     return output
 
+def visible_department_message_rows(db: Session, user: User, district: str | None = None) -> list[DepartmentMessage]:
+    current_role = role_name(db, user)
+    effective_district = district
+    if current_role == "district_sp" and user.district:
+        effective_district = user.district
+
+    q = db.query(DepartmentMessage)
+    if effective_district:
+        q = q.filter(or_(DepartmentMessage.district == effective_district, DepartmentMessage.district == None))
+    rows = q.order_by(DepartmentMessage.id.desc()).all()
+
+    visible_rows: list[DepartmentMessage] = []
+    for row in rows:
+        if row.channel_scope == "direct":
+            if user.username not in {row.sender_username, row.recipient_username}:
+                continue
+        elif row.recipient_username and row.recipient_username != user.username and row.sender_username != user.username:
+            continue
+
+        if current_role == "district_sp" and user.district and row.district not in (None, user.district):
+            continue
+
+        visible_rows.append(row)
+
+    return visible_rows
+
+def department_room_read_lookup(db: Session, username: str) -> dict[str, int]:
+    rows = db.query(DepartmentMessageRead).filter(DepartmentMessageRead.username == username).all()
+    return {row.room_name: row.last_read_message_id for row in rows}
+
+def serialize_department_message(row: DepartmentMessage, current_username: str, read_lookup: dict[str, int]) -> dict:
+    last_read_id = read_lookup.get(row.room_name, 0)
+    is_unread = row.sender_username != current_username and row.id > last_read_id
+    return {
+        "id": row.id,
+        "sender_username": row.sender_username,
+        "recipient_username": row.recipient_username,
+        "district": row.district,
+        "room_name": row.room_name,
+        "channel_scope": row.channel_scope,
+        "priority": row.priority,
+        "message_text": row.message_text,
+        "ack_required": row.ack_required,
+        "case_id": row.case_id,
+        "is_unread": is_unread,
+        "created_at": row.created_at.isoformat(),
+    }
+
+@app.get('/internal-comms/rooms')
+def internal_comms_rooms(
+    district: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    rows = visible_department_message_rows(db, user, district=district)
+    read_lookup = department_room_read_lookup(db, user.username)
+    grouped = defaultdict(lambda: {
+        "room_name": None,
+        "channel_scope": "statewide",
+        "district": None,
+        "case_id": None,
+        "message_count": 0,
+        "unread_count": 0,
+        "latest_sender": None,
+        "latest_priority": "routine",
+        "latest_activity": None,
+        "latest_message": None,
+    })
+
+    for row in rows:
+        slot = grouped[row.room_name]
+        slot["room_name"] = row.room_name
+        slot["channel_scope"] = row.channel_scope
+        slot["district"] = row.district
+        slot["case_id"] = row.case_id
+        slot["message_count"] += 1
+        if row.sender_username != user.username and row.id > read_lookup.get(row.room_name, 0):
+            slot["unread_count"] += 1
+        if slot["latest_activity"] is None or row.created_at > slot["latest_activity"]:
+            slot["latest_sender"] = row.sender_username
+            slot["latest_priority"] = row.priority
+            slot["latest_activity"] = row.created_at
+            slot["latest_message"] = row.message_text
+
+    output = []
+    for room_name, slot in grouped.items():
+        output.append({
+            "room_name": room_name,
+            "channel_scope": slot["channel_scope"],
+            "district": slot["district"],
+            "case_id": slot["case_id"],
+            "message_count": slot["message_count"],
+            "unread_count": slot["unread_count"],
+            "latest_sender": slot["latest_sender"],
+            "latest_priority": slot["latest_priority"],
+            "latest_activity": None if slot["latest_activity"] is None else slot["latest_activity"].isoformat(),
+            "latest_message": slot["latest_message"],
+        })
+    return sorted(output, key=lambda row: row.get("latest_activity") or "", reverse=True)
+
 @app.get('/internal-comms/messages')
 def internal_comms_messages(
     district: str | None = None,
@@ -587,32 +688,24 @@ def internal_comms_messages(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ):
-    q = db.query(DepartmentMessage)
-    if district:
-        q = q.filter(or_(DepartmentMessage.district == district, DepartmentMessage.district == None))
+    rows = visible_department_message_rows(db, user, district=district)
     if room_name:
-        q = q.filter(DepartmentMessage.room_name == room_name)
+        rows = [row for row in rows if row.room_name == room_name]
     if channel_scope:
-        q = q.filter(DepartmentMessage.channel_scope == channel_scope)
+        rows = [row for row in rows if row.channel_scope == channel_scope]
     if case_id:
-        q = q.filter(DepartmentMessage.case_id == case_id)
+        rows = [row for row in rows if row.case_id == case_id]
     if recipient_username:
-        q = q.filter(or_(DepartmentMessage.recipient_username == recipient_username, DepartmentMessage.recipient_username == None))
+        rows = [
+            row for row in rows
+            if row.recipient_username in {None, recipient_username} or row.sender_username == user.username
+        ]
 
-    rows = q.order_by(DepartmentMessage.id.desc()).limit(min(limit, 200)).all()
-    return [{
-        "id": row.id,
-        "sender_username": row.sender_username,
-        "recipient_username": row.recipient_username,
-        "district": row.district,
-        "room_name": row.room_name,
-        "channel_scope": row.channel_scope,
-        "priority": row.priority,
-        "message_text": row.message_text,
-        "ack_required": row.ack_required,
-        "case_id": row.case_id,
-        "created_at": row.created_at.isoformat(),
-    } for row in rows]
+    read_lookup = department_room_read_lookup(db, user.username)
+    return [
+        serialize_department_message(row, user.username, read_lookup)
+        for row in rows[: min(limit, 200)]
+    ]
 
 @app.post('/internal-comms/messages')
 def create_internal_comms_message(
@@ -650,6 +743,37 @@ def create_internal_comms_message(
     log_action(db, user.username, 'create_department_message', 'department_message', str(row.id))
     db.commit()
     return {"status": "created", "message_id": row.id}
+
+@app.post('/internal-comms/mark-read')
+def mark_internal_comms_read(
+    body: DepartmentMessageReadCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    visible_rows = visible_department_message_rows(db, user)
+    room_rows = [row for row in visible_rows if row.room_name == body.room_name]
+    if not room_rows:
+        raise HTTPException(status_code=404, detail='Room not found')
+
+    last_read_message_id = body.last_read_message_id or max(row.id for row in room_rows)
+    receipt = db.query(DepartmentMessageRead).filter(
+        DepartmentMessageRead.username == user.username,
+        DepartmentMessageRead.room_name == body.room_name,
+    ).first()
+    if not receipt:
+        receipt = DepartmentMessageRead(
+            username=user.username,
+            room_name=body.room_name,
+            last_read_message_id=last_read_message_id,
+        )
+        db.add(receipt)
+    else:
+        receipt.last_read_message_id = max(receipt.last_read_message_id, last_read_message_id)
+        receipt.read_at = datetime.utcnow()
+
+    log_action(db, user.username, 'mark_department_room_read', 'department_room', body.room_name)
+    db.commit()
+    return {"status": "ok", "room_name": body.room_name, "last_read_message_id": receipt.last_read_message_id}
 
 @app.get('/graph/case/{case_id}')
 def case_graph(case_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):

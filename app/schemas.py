@@ -1,5 +1,5 @@
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class LoginRequest(BaseModel):
     username: str
@@ -44,6 +44,12 @@ class EvidenceCreate(BaseModel):
     notes: str | None = None
 
 
+class MessageAttachmentCreate(BaseModel):
+    attachment_name: str
+    attachment_type: str = "document"
+    storage_ref: str
+
+
 class DepartmentMessageCreate(BaseModel):
     room_name: str
     message_text: str
@@ -53,6 +59,7 @@ class DepartmentMessageCreate(BaseModel):
     priority: str = "routine"
     ack_required: bool = False
     case_id: int | None = None
+    attachments: list[MessageAttachmentCreate] = Field(default_factory=list)
 
 
 class DepartmentMessageReadCreate(BaseModel):
@@ -66,6 +73,13 @@ class PresenceHeartbeatCreate(BaseModel):
     status_label: str = "active"
 
 
+class TypingHeartbeatCreate(BaseModel):
+    room_name: str
+    district: str | None = None
+    case_id: int | None = None
+    is_typing: bool = True
+
+
 class CheckpointPlanCreate(BaseModel):
     district: str
     checkpoint_name: str
@@ -77,3 +91,50 @@ class CheckpointPlanCreate(BaseModel):
     longitude: float | None = None
     case_id: int | None = None
     notes: str | None = None
+
+
+class GraphSavedViewCreate(BaseModel):
+    title: str
+    district: str | None = None
+    case_id: int | None = None
+    focus_node_id: str | None = None
+    selected_node_ids: list[str] = Field(default_factory=list)
+    notes: str | None = None
+
+
+class GeofenceZoneCreate(BaseModel):
+    district: str
+    zone_name: str
+    geofence_type: str = "watch_zone"
+    station_name: str | None = None
+    center_latitude: float
+    center_longitude: float
+    radius_km: float = 3.0
+    status: str = "active"
+    notes: str | None = None
+
+
+class CameraIncidentAssignmentCreate(BaseModel):
+    camera_asset_id: int
+    incident_id: int | None = None
+    case_id: int | None = None
+    assignment_type: str = "primary_coverage"
+    status: str = "linked"
+    notes: str | None = None
+
+
+class TaskCreate(BaseModel):
+    district: str
+    task_type: str
+    priority: str = "medium"
+    assigned_unit: str | None = None
+    status: str = "queued"
+    details: str | None = None
+    case_id: int | None = None
+
+
+class TaskActionCreate(BaseModel):
+    action: str
+    notes: str | None = None
+    assigned_unit: str | None = None
+    status: str | None = None

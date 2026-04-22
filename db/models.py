@@ -349,6 +349,26 @@ class DepartmentMessageRead(Base):
     last_read_message_id = Column(Integer, nullable=False, default=0)
     read_at = Column(DateTime, default=datetime.utcnow)
 
+class MessageAttachment(Base):
+    __tablename__ = "message_attachments"
+    id = Column(Integer, primary_key=True)
+    message_id = Column(Integer, ForeignKey("department_messages.id"), nullable=False)
+    attachment_name = Column(String(180), nullable=False)
+    attachment_type = Column(String(60), default="document")
+    storage_ref = Column(String(255), nullable=False)
+    uploaded_by = Column(String(80), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class RoomTypingSignal(Base):
+    __tablename__ = "room_typing_signals"
+    id = Column(Integer, primary_key=True)
+    username = Column(String(80), nullable=False)
+    room_name = Column(String(120), nullable=False)
+    district = Column(String(80))
+    case_id = Column(Integer, ForeignKey("cases.id"), nullable=True)
+    typing_until = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class PersonnelPresence(Base):
     __tablename__ = "personnel_presence"
     id = Column(Integer, primary_key=True)
@@ -372,6 +392,77 @@ class CheckpointPlan(Base):
     case_id = Column(Integer, ForeignKey("cases.id"), nullable=True)
     notes = Column(Text)
     created_by = Column(String(80), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class GraphSavedView(Base):
+    __tablename__ = "graph_saved_views"
+    id = Column(Integer, primary_key=True)
+    username = Column(String(80), nullable=False)
+    title = Column(String(180), nullable=False)
+    district = Column(String(80))
+    case_id = Column(Integer, ForeignKey("cases.id"), nullable=True)
+    focus_node_id = Column(String(120))
+    selected_node_ids_json = Column(Text)
+    notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class GeoBoundary(Base):
+    __tablename__ = "geo_boundaries"
+    id = Column(Integer, primary_key=True)
+    boundary_type = Column(String(60), nullable=False)
+    district = Column(String(80), nullable=False)
+    station_name = Column(String(160))
+    zone_name = Column(String(180), nullable=False)
+    centroid_latitude = Column(Float)
+    centroid_longitude = Column(Float)
+    points_json = Column(Text, nullable=False)
+    boundary_rank = Column(String(40), default="operational")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class GeofenceZone(Base):
+    __tablename__ = "geofence_zones"
+    id = Column(Integer, primary_key=True)
+    district = Column(String(80), nullable=False)
+    station_name = Column(String(160))
+    zone_name = Column(String(180), nullable=False)
+    geofence_type = Column(String(80), default="watch_zone")
+    center_latitude = Column(Float, nullable=False)
+    center_longitude = Column(Float, nullable=False)
+    radius_km = Column(Float, default=3.0)
+    points_json = Column(Text, nullable=False)
+    status = Column(String(40), default="active")
+    notes = Column(Text)
+    created_by = Column(String(80), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class CameraAsset(Base):
+    __tablename__ = "camera_assets"
+    id = Column(Integer, primary_key=True)
+    camera_id = Column(String(120), unique=True, nullable=False)
+    district = Column(String(80), nullable=False)
+    station_id = Column(Integer, ForeignKey("stations.id"), nullable=True)
+    zone_name = Column(String(180))
+    camera_type = Column(String(80), default="PTZ")
+    status = Column(String(40), default="online")
+    health_score = Column(Float, default=0.0)
+    blind_spot_score = Column(Float, default=0.0)
+    retention_profile = Column(String(60), default="60 days")
+    owner_unit = Column(String(120))
+    latitude = Column(Float)
+    longitude = Column(Float)
+    last_heartbeat_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class CameraIncidentAssignment(Base):
+    __tablename__ = "camera_incident_assignments"
+    id = Column(Integer, primary_key=True)
+    camera_asset_id = Column(Integer, ForeignKey("camera_assets.id"), nullable=False)
+    incident_id = Column(Integer, ForeignKey("incidents.id"), nullable=True)
+    case_id = Column(Integer, ForeignKey("cases.id"), nullable=True)
+    assignment_type = Column(String(80), default="primary_coverage")
+    status = Column(String(40), default="linked")
+    notes = Column(Text)
+    assigned_by = Column(String(80), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class GraphSnapshot(Base):

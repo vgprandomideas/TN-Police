@@ -1,9 +1,13 @@
 
 import csv
+import json
+import math
 from pathlib import Path
 from db.database import Base, engine, SessionLocal
 from db.models import (
     AlertRule,
+    CameraAsset,
+    CameraIncidentAssignment,
     Case,
     CaseTimelineEvent,
     CheckpointPlan,
@@ -11,12 +15,18 @@ from db.models import (
     DepartmentMessage,
     EvidenceAttachment,
     EvidenceIntegrityLog,
+    GeoBoundary,
+    GeofenceZone,
+    GraphSavedView,
+    Incident,
     NarrativeBrief,
     NotificationEvent,
     PersonnelPresence,
     Role,
     Station,
     StationRoutingRule,
+    TaskExecution,
+    TaskQueue,
     TimelineDigest,
     User,
 )
@@ -369,6 +379,268 @@ def seed_checkpoint_plans(db):
         db.add(CheckpointPlan(**payload))
     db.commit()
 
+
+def build_geo_polygon(center_latitude, center_longitude, radius_lat=0.16, radius_lon=0.18, sides=6, rotation_deg=-30.0):
+    points = []
+    for index in range(sides):
+        angle = math.radians(rotation_deg + ((360 / sides) * index))
+        points.append(
+            {
+                "latitude": round(center_latitude + (math.sin(angle) * radius_lat), 6),
+                "longitude": round(center_longitude + (math.cos(angle) * radius_lon), 6),
+            }
+        )
+    return json.dumps(points)
+
+
+def seed_geo_boundaries_and_geofences(db):
+    district_csv_path = Path(__file__).resolve().parents[1] / "data" / "tn_district_coordinates.csv"
+    district_rows = []
+    if district_csv_path.exists():
+        with open(district_csv_path, newline="", encoding="utf-8") as handle:
+            district_rows = list(csv.DictReader(handle))
+
+    for row in district_rows:
+        district = row["district"]
+        latitude = float(row["latitude"])
+        longitude = float(row["longitude"])
+        district_zone_name = f"{district} District Boundary"
+        if not db.query(GeoBoundary).filter_by(boundary_type="district", district=district, zone_name=district_zone_name).first():
+            db.add(
+                GeoBoundary(
+                    boundary_type="district",
+                    district=district,
+                    zone_name=district_zone_name,
+                    centroid_latitude=latitude,
+                    centroid_longitude=longitude,
+                    points_json=build_geo_polygon(latitude, longitude, radius_lat=0.18, radius_lon=0.2, sides=8),
+                    boundary_rank="command",
+                )
+            )
+
+    station_rows = db.query(Station).order_by(Station.district, Station.station_name).all()
+    for index, station in enumerate(station_rows):
+        station_zone_name = f"{station.station_name} Station Boundary"
+        if not db.query(GeoBoundary).filter_by(boundary_type="station", district=station.district, zone_name=station_zone_name).first():
+            db.add(
+                GeoBoundary(
+                    boundary_type="station",
+                    district=station.district,
+                    station_name=station.station_name,
+                    zone_name=station_zone_name,
+                    centroid_latitude=station.latitude,
+                    centroid_longitude=station.longitude,
+                    points_json=build_geo_polygon(station.latitude, station.longitude, radius_lat=0.038, radius_lon=0.042, sides=6),
+                    boundary_rank="station",
+                )
+            )
+        patrol_zone_name = f"{station.station_name} Patrol Sector"
+        if not db.query(GeoBoundary).filter_by(boundary_type="patrol_sector", district=station.district, zone_name=patrol_zone_name).first():
+            db.add(
+                GeoBoundary(
+                    boundary_type="patrol_sector",
+                    district=station.district,
+                    station_name=station.station_name,
+                    zone_name=patrol_zone_name,
+                    centroid_latitude=station.latitude + (0.01 if index % 2 == 0 else -0.008),
+                    centroid_longitude=station.longitude + (0.01 if index % 3 == 0 else -0.006),
+                    points_json=build_geo_polygon(station.latitude, station.longitude, radius_lat=0.024, radius_lon=0.028, sides=5),
+                    boundary_rank="patrol",
+                )
+            )
+
+    seeded_geofences = [
+        ("Chennai", "North Port Interdiction Ring", "high_watch", "Chennai Central", 13.0922, 80.2911, 4.8, "Cargo interdiction watch around logistics corridor."),
+        ("Coimbatore", "Avinashi Device Sweep Zone", "device_sweep", "Coimbatore Central", 11.0174, 76.9691, 3.6, "SIM-swap and handset sweep geofence for corridor screening."),
+        ("Madurai", "Temple Corridor Movement Fence", "movement_watch", "Madurai Central", 9.9252, 78.1198, 3.9, "Route interception and crowd-aware movement watch zone."),
+        ("Thoothukudi", "Harbor Freight Camera Fence", "camera_priority", "Thoothukudi Central", 8.8053, 78.1511, 4.2, "Camera reinforcement and freight-watch geofence."),
+    ]
+    for district, zone_name, geofence_type, station_name, latitude, longitude, radius_km, notes in seeded_geofences:
+        if not db.query(GeofenceZone).filter_by(district=district, zone_name=zone_name).first():
+            db.add(
+                GeofenceZone(
+                    district=district,
+                    station_name=station_name,
+                    zone_name=zone_name,
+                    geofence_type=geofence_type,
+                    center_latitude=latitude,
+                    center_longitude=longitude,
+                    radius_km=radius_km,
+                    points_json=build_geo_polygon(latitude, longitude, radius_lat=radius_km / 95.0, radius_lon=radius_km / 102.0, sides=7),
+                    status="active",
+                    notes=notes,
+                    created_by="admin_tn",
+                )
+            )
+
+    db.commit()
+
+
+def seed_camera_assets_and_assignments(db):
+    station_rows = db.query(Station).order_by(Station.district, Station.id).all()
+    for station_index, station in enumerate(station_rows):
+        camera_profiles = [
+            ("PTZ", 0.94, 8.2, "90 days"),
+            ("ANPR", 0.88, 10.4, "60 days"),
+            ("Dome", 0.91, 6.4, "45 days"),
+        ]
+        for profile_index, (camera_type, health_score, blind_spot_score, retention_profile) in enumerate(camera_profiles, start=1):
+            camera_code = f"{station.district[:3].upper()}-{station.id:03d}-{profile_index:02d}"
+            if db.query(CameraAsset).filter_by(camera_id=camera_code).first():
+                continue
+            adjusted_health = max(0.58, round(health_score - ((station_index % 7) * 0.03), 2))
+            adjusted_blind = round(blind_spot_score + ((station_index % 5) * 0.8), 2)
+            status = "online" if adjusted_health >= 0.82 else "degraded" if adjusted_health >= 0.68 else "maintenance"
+            db.add(
+                CameraAsset(
+                    camera_id=camera_code,
+                    district=station.district,
+                    station_id=station.id,
+                    zone_name=f"{station.station_name} {camera_type} Watch",
+                    camera_type=camera_type,
+                    status=status,
+                    health_score=adjusted_health,
+                    blind_spot_score=adjusted_blind,
+                    retention_profile=retention_profile,
+                    owner_unit=f"{station.station_name} Surveillance Cell",
+                    latitude=station.latitude + (0.003 * profile_index),
+                    longitude=station.longitude + (0.002 * profile_index),
+                )
+            )
+    db.commit()
+
+    incidents = db.query(Incident).order_by(Incident.created_at.desc()).limit(18).all()
+    cameras = db.query(CameraAsset).order_by(CameraAsset.id).all()
+    cameras_by_district = {}
+    for camera in cameras:
+        cameras_by_district.setdefault(camera.district, []).append(camera)
+
+    for incident in incidents:
+        district_cameras = cameras_by_district.get(incident.district, [])
+        for camera in district_cameras[:2]:
+            exists = db.query(CameraIncidentAssignment).filter_by(camera_asset_id=camera.id, incident_id=incident.id).first()
+            if exists:
+                continue
+            db.add(
+                CameraIncidentAssignment(
+                    camera_asset_id=camera.id,
+                    incident_id=incident.id,
+                    case_id=None,
+                    assignment_type="incident_cover",
+                    status="linked",
+                    notes=f"Seeded coverage assignment for incident {incident.id} in {incident.district}.",
+                    assigned_by="admin_tn",
+                )
+            )
+    db.commit()
+
+
+def seed_graph_saved_views(db):
+    demo_views = [
+        {
+            "username": "admin_tn",
+            "title": "Statewide High-Risk Convergence",
+            "district": None,
+            "case_id": None,
+            "focus_node_id": "entity-1",
+            "selected_node_ids_json": json.dumps(["entity-1", "entity-2", "entity-5", "entity-7"]),
+            "notes": "High-risk statewide convergence around linked phones, vehicles, and beneficiaries.",
+        },
+        {
+            "username": "cyber_analyst",
+            "title": "SIM Swap Cluster Trace",
+            "district": "Chennai",
+            "case_id": 3,
+            "focus_node_id": "entity-3",
+            "selected_node_ids_json": json.dumps(["entity-3", "entity-4", "case-3"]),
+            "notes": "Focused cyber-fraud trace around case-linked devices and subscriber pivots.",
+        },
+    ]
+    for payload in demo_views:
+        if db.query(GraphSavedView).filter_by(username=payload["username"], title=payload["title"]).first():
+            continue
+        db.add(GraphSavedView(**payload))
+    db.commit()
+
+
+def seed_dispatch_workflow(db):
+    demo_tasks = [
+        {
+            "district": "Chennai",
+            "task_type": "corridor_intercept",
+            "priority": "high",
+            "assigned_unit": "Traffic Intercept Unit Alpha",
+            "status": "in_progress",
+            "details": "Maintain ANPR-backed corridor intercept coverage around OMR vehicle route.",
+            "case_id": 1,
+            "created_by": "admin_tn",
+            "actions": [
+                ("created", "Task opened from corridor route watch.", "Traffic Intercept Unit Alpha", "queued"),
+                ("approved", "District command approved intercept posture.", "Traffic Intercept Unit Alpha", "approved"),
+                ("deployed", "Field unit deployed to the active corridor.", "Traffic Intercept Unit Alpha", "in_progress"),
+            ],
+        },
+        {
+            "district": "Coimbatore",
+            "task_type": "device_screening_sweep",
+            "priority": "critical",
+            "assigned_unit": "Cyber Mobile Team 2",
+            "status": "approved",
+            "details": "Prepare device screening sweep for the linked SIM-swap route.",
+            "case_id": 3,
+            "created_by": "cyber_analyst",
+            "actions": [
+                ("created", "Task created from fusion route convergence.", "Cyber Mobile Team 2", "queued"),
+                ("assigned", "Screening unit assigned to field operation.", "Cyber Mobile Team 2", "assigned"),
+                ("approved", "Approval granted by command for field execution.", "Cyber Mobile Team 2", "approved"),
+            ],
+        },
+        {
+            "district": "Madurai",
+            "task_type": "perimeter_lock",
+            "priority": "medium",
+            "assigned_unit": "District Response Team",
+            "status": "completed",
+            "details": "Temporary perimeter lock around south-junction corridor with closure report pending.",
+            "case_id": None,
+            "created_by": "district_sp",
+            "actions": [
+                ("created", "Perimeter lock drafted from war-room planning.", "District Response Team", "queued"),
+                ("executed", "Perimeter lock activated around active junction.", "District Response Team", "in_progress"),
+                ("closed", "Action closed after corridor review and debrief.", "District Response Team", "completed"),
+            ],
+        },
+    ]
+
+    for payload in demo_tasks:
+        task = db.query(TaskQueue).filter_by(district=payload["district"], task_type=payload["task_type"], details=payload["details"]).first()
+        if not task:
+            task = TaskQueue(
+                district=payload["district"],
+                task_type=payload["task_type"],
+                priority=payload["priority"],
+                assigned_unit=payload["assigned_unit"],
+                status=payload["status"],
+                details=payload["details"],
+                case_id=payload["case_id"],
+                created_by=payload["created_by"],
+            )
+            db.add(task)
+            db.flush()
+
+        for action, notes, assigned_unit, resulting_status in payload["actions"]:
+            if db.query(TaskExecution).filter_by(task_id=task.id, action=action, notes=notes).first():
+                continue
+            db.add(
+                TaskExecution(
+                    task_id=task.id,
+                    actor=payload["created_by"],
+                    action=action,
+                    notes=f"{notes} Assigned unit: {assigned_unit}. Status: {resulting_status}.",
+                )
+            )
+    db.commit()
+
 def main():
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -382,6 +654,10 @@ def main():
         seed_department_messages(db)
         seed_personnel_presence(db)
         seed_checkpoint_plans(db)
+        seed_geo_boundaries_and_geofences(db)
+        seed_camera_assets_and_assignments(db)
+        seed_graph_saved_views(db)
+        seed_dispatch_workflow(db)
     finally:
         db.close()
 

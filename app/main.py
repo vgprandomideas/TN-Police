@@ -1,7 +1,11 @@
 
-from collections import defaultdict
-from datetime import datetime
-from fastapi import FastAPI, Depends, HTTPException, Query
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
+import json
+import math
+import re
+from pathlib import Path
+from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -11,15 +15,17 @@ from app.config import JWT_SECRET, JWT_ALGORITHM
 from app.schemas import (
     LoginRequest, ComplaintCreate, CaseCreate, CaseCommentCreate,
     CaseAssignCreate, ComplaintCaseLinkCreate, WatchlistCreate, EvidenceCreate,
-    DepartmentMessageCreate, DepartmentMessageReadCreate, PresenceHeartbeatCreate, CheckpointPlanCreate
+    DepartmentMessageCreate, DepartmentMessageReadCreate, PresenceHeartbeatCreate, CheckpointPlanCreate,
+    TypingHeartbeatCreate, GraphSavedViewCreate, GeofenceZoneCreate, CameraIncidentAssignmentCreate,
+    TaskCreate, TaskActionCreate
 )
-from db.database import get_db
+from db.database import get_db, SessionLocal
 from db.models import (
     User, Role, PublicMetric, Complaint, Alert, Entity, EntityLink, Station, AuditLog, Case,
     CaseComment, CaseAssignment, Incident, IngestQueue, ComplaintCaseLink, ConnectorRegistry,
     Watchlist, WatchlistHit, EvidenceAttachment, CaseTimelineEvent, StationRoutingRule,
     ProsecutionPacket, CustodyLog, MedicalCheckLog, EventCommandBoard,
-    DocumentIntake, ExtractedEntity, CourtHearing, PrisonMovement, NotificationEvent, DepartmentMessage, DepartmentMessageRead, PersonnelPresence, CheckpointPlan, GraphSnapshot, GeoFenceAlert, AdapterStub, TaskQueue, TaskExecution, SuspectDossier, GraphInsight, CourtPacketExport, EvidenceIntegrityLog, NarrativeBrief, HotspotForecast, PatrolCoverageMetric, SimilarityHit, TimelineDigest, ExportJob, WarRoomSnapshot, ExplorationBookmark
+    DocumentIntake, ExtractedEntity, CourtHearing, PrisonMovement, NotificationEvent, DepartmentMessage, DepartmentMessageRead, MessageAttachment, RoomTypingSignal, PersonnelPresence, CheckpointPlan, GraphSavedView, GeoBoundary, GeofenceZone, CameraAsset, CameraIncidentAssignment, GraphSnapshot, GeoFenceAlert, AdapterStub, TaskQueue, TaskExecution, SuspectDossier, GraphInsight, CourtPacketExport, EvidenceIntegrityLog, NarrativeBrief, HotspotForecast, PatrolCoverageMetric, SimilarityHit, TimelineDigest, ExportJob, WarRoomSnapshot, ExplorationBookmark
 )
 from services.auth import verify_password, create_access_token
 from services.permissions import (
@@ -32,6 +38,42 @@ from services.routing import pick_station_for_case
 
 app = FastAPI(title="TN Police Intelligence Platform Final")
 security = HTTPBearer()
+MENTION_PATTERN = re.compile(r"@([A-Za-z0-9_]+)")
+
+
+class RealtimeConnectionManager:
+    def __init__(self):
+        self.connections: dict[str, list[WebSocket]] = defaultdict(list)
+
+    async def connect(self, room_name: str, websocket: WebSocket):
+        await websocket.accept()
+        self.connections[room_name].append(websocket)
+
+    def disconnect(self, room_name: str, websocket: WebSocket):
+        room_connections = self.connections.get(room_name, [])
+        if websocket in room_connections:
+            room_connections.remove(websocket)
+        if not room_connections:
+            self.connections.pop(room_name, None)
+
+    async def broadcast(self, room_name: str, payload: dict):
+        for websocket in list(self.connections.get(room_name, [])):
+            try:
+                await websocket.send_json(payload)
+            except Exception:
+                self.disconnect(room_name, websocket)
+
+
+realtime_manager = RealtimeConnectionManager()
+
+
+def dispatch_realtime_payload(room_name: str, payload: dict):
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(realtime_manager.broadcast(room_name, payload))
+    except RuntimeError:
+        asyncio.run(realtime_manager.broadcast(room_name, payload))
 
 def current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
     token = credentials.credentials
@@ -40,6 +82,18 @@ def current_user(credentials: HTTPAuthorizationCredentials = Depends(security), 
         username = payload.get("sub")
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
+    user = db.query(User).filter(User.username == username, User.is_active == True).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+def current_user_from_token(token: str, db: Session) -> User:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        username = payload.get("sub")
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid token") from exc
     user = db.query(User).filter(User.username == username, User.is_active == True).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
@@ -54,6 +108,185 @@ def log_action(db: Session, username: str, action: str, object_type: str, object
 
 def add_timeline(db: Session, case_id: int, event_type: str, actor: str, details: str):
     db.add(CaseTimelineEvent(case_id=case_id, event_type=event_type, actor=actor, details=details))
+
+
+def build_geo_polygon(center_latitude: float, center_longitude: float, radius_km: float, sides: int = 6, rotation_deg: float = -30.0) -> str:
+    radius_lat = radius_km / 111.0
+    radius_lon = radius_km / max(111.0 * max(math.cos(math.radians(center_latitude)), 0.2), 0.2)
+    points = []
+    for index in range(sides):
+        angle = math.radians(rotation_deg + ((360 / sides) * index))
+        points.append(
+            {
+                "latitude": round(center_latitude + (math.sin(angle) * radius_lat), 6),
+                "longitude": round(center_longitude + (math.cos(angle) * radius_lon), 6),
+            }
+        )
+    return json.dumps(points)
+
+
+def parse_message_mentions(db: Session, message_text: str) -> list[str]:
+    active_usernames = {
+        row.username
+        for row in db.query(User.username).filter(User.is_active == True).all()
+    }
+    return sorted(
+        {
+            match.group(1)
+            for match in MENTION_PATTERN.finditer(message_text or "")
+            if match.group(1) in active_usernames
+        }
+    )
+
+
+def parse_message_mentions_text(message_text: str) -> list[str]:
+    return sorted({match.group(1) for match in MENTION_PATTERN.finditer(message_text or "")})
+
+
+def department_attachment_lookup(db: Session, message_ids: list[int]) -> dict[int, list[dict]]:
+    if not message_ids:
+        return {}
+    rows = db.query(MessageAttachment).filter(MessageAttachment.message_id.in_(message_ids)).order_by(MessageAttachment.id.asc()).all()
+    grouped: dict[int, list[dict]] = defaultdict(list)
+    for row in rows:
+        grouped[row.message_id].append(
+            {
+                "id": row.id,
+                "attachment_name": row.attachment_name,
+                "attachment_type": row.attachment_type,
+                "storage_ref": row.storage_ref,
+                "uploaded_by": row.uploaded_by,
+                "created_at": row.created_at.isoformat(),
+            }
+        )
+    return grouped
+
+
+def typing_signal_rows(db: Session, room_name: str | None = None, district: str | None = None) -> list[RoomTypingSignal]:
+    q = db.query(RoomTypingSignal).filter(RoomTypingSignal.typing_until >= datetime.utcnow())
+    if room_name:
+        q = q.filter(RoomTypingSignal.room_name == room_name)
+    if district:
+        q = q.filter(or_(RoomTypingSignal.district == district, RoomTypingSignal.district == None))
+    return q.order_by(RoomTypingSignal.typing_until.desc()).all()
+
+
+def build_graph_scope(db: Session, district: str | None = None, case_id: int | None = None) -> tuple[dict[str, dict], list[dict]]:
+    nodes: dict[str, dict] = {}
+    edges: list[dict] = []
+
+    entity_query = db.query(Entity)
+    if district:
+        entity_query = entity_query.filter(or_(Entity.district == district, Entity.district == None))
+    entity_rows = entity_query.all()
+    entity_ids = {row.id for row in entity_rows}
+    for row in entity_rows:
+        node_id = f"entity-{row.id}"
+        nodes[node_id] = {
+            "id": node_id,
+            "label": row.display_name,
+            "type": row.entity_type,
+            "district": row.district,
+            "risk_score": row.risk_score,
+        }
+
+    link_query = db.query(EntityLink)
+    if entity_ids:
+        link_query = link_query.filter(
+            EntityLink.source_entity_id.in_(entity_ids),
+            EntityLink.target_entity_id.in_(entity_ids),
+        )
+    for row in link_query.all():
+        source_id = f"entity-{row.source_entity_id}"
+        target_id = f"entity-{row.target_entity_id}"
+        if source_id in nodes and target_id in nodes:
+            edges.append(
+                {
+                    "source": source_id,
+                    "target": target_id,
+                    "label": row.relationship_type,
+                    "weight": row.weight,
+                }
+            )
+
+    if case_id:
+        case = db.query(Case).filter(Case.id == case_id).first()
+        if case:
+            case_node_id = f"case-{case.id}"
+            nodes[case_node_id] = {
+                "id": case_node_id,
+                "label": case.title,
+                "type": "case",
+                "district": case.district,
+                "risk_score": 0.95 if case.priority in {"high", "critical"} else 0.55,
+            }
+            for row in db.query(EvidenceAttachment).filter(EvidenceAttachment.case_id == case_id).all():
+                evidence_id = f"evidence-{row.id}"
+                nodes[evidence_id] = {
+                    "id": evidence_id,
+                    "label": row.file_name,
+                    "type": "evidence",
+                    "district": case.district,
+                    "risk_score": 0.42,
+                }
+                edges.append(
+                    {
+                        "source": case_node_id,
+                        "target": evidence_id,
+                        "label": row.attachment_type,
+                        "weight": 1.0,
+                    }
+                )
+            for row in db.query(WatchlistHit).filter(WatchlistHit.case_id == case_id).all():
+                entity_node_id = f"entity-{row.entity_id}" if row.entity_id else None
+                if entity_node_id and entity_node_id in nodes:
+                    edges.append(
+                        {
+                            "source": case_node_id,
+                            "target": entity_node_id,
+                            "label": "watchlist_hit",
+                            "weight": max(row.confidence, 0.55),
+                        }
+                    )
+    return nodes, edges
+
+
+def graph_adjacency(edges: list[dict]) -> dict[str, list[tuple[str, dict]]]:
+    adjacency: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    for row in edges:
+        source = str(row.get("source"))
+        target = str(row.get("target"))
+        adjacency[source].append((target, row))
+        adjacency[target].append((source, row))
+    return adjacency
+
+
+def shortest_graph_path(nodes: dict[str, dict], edges: list[dict], source_node_id: str, target_node_id: str) -> dict:
+    adjacency = graph_adjacency(edges)
+    queue = deque([(source_node_id, [source_node_id], [])])
+    visited = {source_node_id}
+    while queue:
+        node_id, path_nodes, path_edges = queue.popleft()
+        if node_id == target_node_id:
+            return {
+                "path_found": True,
+                "path_node_ids": path_nodes,
+                "path_nodes": [nodes[row_id] for row_id in path_nodes if row_id in nodes],
+                "path_edges": path_edges,
+                "hop_count": max(len(path_nodes) - 1, 0),
+            }
+        for peer_id, edge in adjacency.get(node_id, []):
+            if peer_id in visited:
+                continue
+            visited.add(peer_id)
+            queue.append((peer_id, path_nodes + [peer_id], path_edges + [edge]))
+    return {
+        "path_found": False,
+        "path_node_ids": [],
+        "path_nodes": [],
+        "path_edges": [],
+        "hop_count": 0,
+    }
 
 @app.get('/')
 @app.get('/health')
@@ -607,9 +840,15 @@ def department_room_read_lookup(db: Session, username: str) -> dict[str, int]:
     rows = db.query(DepartmentMessageRead).filter(DepartmentMessageRead.username == username).all()
     return {row.room_name: row.last_read_message_id for row in rows}
 
-def serialize_department_message(row: DepartmentMessage, current_username: str, read_lookup: dict[str, int]) -> dict:
+def serialize_department_message(
+    row: DepartmentMessage,
+    current_username: str,
+    read_lookup: dict[str, int],
+    attachment_lookup: dict[int, list[dict]] | None = None,
+) -> dict:
     last_read_id = read_lookup.get(row.room_name, 0)
     is_unread = row.sender_username != current_username and row.id > last_read_id
+    mention_usernames = parse_message_mentions_text(row.message_text)
     return {
         "id": row.id,
         "sender_username": row.sender_username,
@@ -622,6 +861,9 @@ def serialize_department_message(row: DepartmentMessage, current_username: str, 
         "ack_required": row.ack_required,
         "case_id": row.case_id,
         "is_unread": is_unread,
+        "mentioned_usernames": mention_usernames,
+        "mentions_me": current_username in mention_usernames,
+        "attachments": [] if attachment_lookup is None else attachment_lookup.get(row.id, []),
         "created_at": row.created_at.isoformat(),
     }
 
@@ -689,6 +931,10 @@ def internal_comms_rooms(
 ):
     rows = visible_department_message_rows(db, user, district=district)
     read_lookup = department_room_read_lookup(db, user.username)
+    active_typing = typing_signal_rows(db, district=district)
+    typing_by_room = defaultdict(int)
+    for row in active_typing:
+        typing_by_room[row.room_name] += 1
     grouped = defaultdict(lambda: {
         "room_name": None,
         "channel_scope": "statewide",
@@ -730,6 +976,7 @@ def internal_comms_rooms(
             "latest_priority": slot["latest_priority"],
             "latest_activity": None if slot["latest_activity"] is None else slot["latest_activity"].isoformat(),
             "latest_message": slot["latest_message"],
+            "typing_count": typing_by_room.get(room_name, 0),
         })
     return sorted(output, key=lambda row: row.get("latest_activity") or "", reverse=True)
 
@@ -758,8 +1005,9 @@ def internal_comms_messages(
         ]
 
     read_lookup = department_room_read_lookup(db, user.username)
+    attachment_lookup = department_attachment_lookup(db, [row.id for row in rows[: min(limit, 200)]])
     return [
-        serialize_department_message(row, user.username, read_lookup)
+        serialize_department_message(row, user.username, read_lookup, attachment_lookup=attachment_lookup)
         for row in rows[: min(limit, 200)]
     ]
 
@@ -769,6 +1017,7 @@ def create_internal_comms_message(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ):
+    clean_mentions = parse_message_mentions(db, body.message_text)
     row = DepartmentMessage(
         sender_username=user.username,
         recipient_username=body.recipient_username,
@@ -783,6 +1032,17 @@ def create_internal_comms_message(
     db.add(row)
     db.flush()
 
+    for attachment in body.attachments:
+        db.add(
+            MessageAttachment(
+                message_id=row.id,
+                attachment_name=attachment.attachment_name,
+                attachment_type=attachment.attachment_type,
+                storage_ref=attachment.storage_ref,
+                uploaded_by=user.username,
+            )
+        )
+
     recipient = body.recipient_username or body.room_name
     db.add(
         NotificationEvent(
@@ -796,8 +1056,28 @@ def create_internal_comms_message(
             related_object_id=str(row.id),
         )
     )
+    for mentioned_username in clean_mentions:
+        if mentioned_username == user.username:
+            continue
+        db.add(
+            NotificationEvent(
+                notification_type="mention",
+                channel="in_app",
+                recipient=mentioned_username,
+                subject=f"Mention in {body.room_name}",
+                message=body.message_text,
+                status="queued",
+                related_object_type="department_message",
+                related_object_id=str(row.id),
+            )
+        )
     log_action(db, user.username, 'create_department_message', 'department_message', str(row.id))
     db.commit()
+    attachment_lookup = department_attachment_lookup(db, [row.id])
+    payload = serialize_department_message(row, user.username, {row.room_name: row.id}, attachment_lookup=attachment_lookup)
+    payload["event_type"] = "message"
+    payload["mentioned_usernames"] = clean_mentions
+    dispatch_realtime_payload(row.room_name, payload)
     return {"status": "created", "message_id": row.id}
 
 @app.post('/internal-comms/mark-read')
@@ -830,6 +1110,103 @@ def mark_internal_comms_read(
     log_action(db, user.username, 'mark_department_room_read', 'department_room', body.room_name)
     db.commit()
     return {"status": "ok", "room_name": body.room_name, "last_read_message_id": receipt.last_read_message_id}
+
+
+@app.get('/internal-comms/typing')
+def internal_comms_typing(
+    room_name: str | None = None,
+    district: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    rows = typing_signal_rows(db, room_name=room_name, district=district)
+    current_role = role_name(db, user)
+    return [
+        {
+            "username": row.username,
+            "room_name": row.room_name,
+            "district": row.district,
+            "case_id": row.case_id,
+            "typing_until": row.typing_until.isoformat(),
+            "seconds_remaining": max(int((row.typing_until - datetime.utcnow()).total_seconds()), 0),
+        }
+        for row in rows
+        if row.username != user.username and not (current_role == "district_sp" and user.district and row.district not in {None, user.district})
+    ]
+
+
+@app.post('/internal-comms/typing')
+def internal_comms_typing_heartbeat(
+    body: TypingHeartbeatCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    row = db.query(RoomTypingSignal).filter(
+        RoomTypingSignal.username == user.username,
+        RoomTypingSignal.room_name == body.room_name,
+    ).first()
+    if body.is_typing:
+        if not row:
+            row = RoomTypingSignal(username=user.username, room_name=body.room_name)
+            db.add(row)
+        row.district = body.district or user.district
+        row.case_id = body.case_id
+        row.typing_until = datetime.utcnow() + timedelta(seconds=16)
+        db.commit()
+        payload = {
+            "event_type": "typing",
+            "username": user.username,
+            "room_name": body.room_name,
+            "district": row.district,
+            "typing_until": row.typing_until.isoformat(),
+        }
+        dispatch_realtime_payload(body.room_name, payload)
+        return {"status": "ok", **payload}
+    if row:
+        db.delete(row)
+        db.commit()
+    payload = {
+        "event_type": "typing_stopped",
+        "username": user.username,
+        "room_name": body.room_name,
+    }
+    dispatch_realtime_payload(body.room_name, payload)
+    return {"status": "ok", **payload}
+
+
+@app.websocket('/internal-comms/ws')
+async def internal_comms_ws(websocket: WebSocket):
+    token = websocket.query_params.get("token")
+    room_name = websocket.query_params.get("room_name") or "State Command Net"
+    district = websocket.query_params.get("district")
+    db = SessionLocal()
+    try:
+        if not token:
+            await websocket.close(code=4401)
+            return
+        try:
+            user = current_user_from_token(token, db)
+        except HTTPException:
+            await websocket.close(code=4401)
+            return
+        if district and role_name(db, user) == "district_sp" and user.district and district != user.district:
+            await websocket.close(code=4403)
+            return
+        await realtime_manager.connect(room_name, websocket)
+        await websocket.send_json(
+            {
+                "event_type": "connected",
+                "room_name": room_name,
+                "district": district or user.district,
+                "username": user.username,
+            }
+        )
+        while True:
+            _ = await websocket.receive_text()
+    except WebSocketDisconnect:
+        realtime_manager.disconnect(room_name, websocket)
+    finally:
+        db.close()
 
 @app.get('/checkpoint-plans')
 def checkpoint_plans(
@@ -902,6 +1279,138 @@ def case_graph(case_id: int, db: Session = Depends(get_db), user: User = Depends
         edges.append({"source": f"case-{case_id}", "target": f"evidence-{ev.id}", "label": ev.attachment_type, "weight": 1})
     return {"nodes": nodes, "edges": edges, "snapshot": None if not snapshot else {"node_count": snapshot.node_count, "edge_count": snapshot.edge_count, "risk_density": snapshot.risk_density, "summary": snapshot.summary}, "timeline_count": len(timeline), "complaint_links": len(links)}
 
+
+@app.get('/graph/expand')
+def graph_expand(
+    node_id: str,
+    district: str | None = None,
+    case_id: int | None = None,
+    depth: int = 1,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    nodes, edges = build_graph_scope(db, district=district, case_id=case_id)
+    if node_id not in nodes:
+        raise HTTPException(status_code=404, detail='Graph node not found')
+    adjacency = graph_adjacency(edges)
+    queue = deque([(node_id, 0)])
+    visited = {node_id}
+    while queue:
+        current_id, current_depth = queue.popleft()
+        if current_depth >= max(min(depth, 3), 1):
+            continue
+        for peer_id, _edge in adjacency.get(current_id, []):
+            if peer_id in visited:
+                continue
+            visited.add(peer_id)
+            queue.append((peer_id, current_depth + 1))
+    expanded_edges = [row for row in edges if row["source"] in visited and row["target"] in visited]
+    return {
+        "center_node": nodes[node_id],
+        "depth": max(min(depth, 3), 1),
+        "nodes": [nodes[row_id] for row_id in visited if row_id in nodes],
+        "edges": expanded_edges,
+    }
+
+
+@app.get('/graph/trace')
+def graph_trace(
+    source_node_id: str,
+    target_node_id: str,
+    district: str | None = None,
+    case_id: int | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    nodes, edges = build_graph_scope(db, district=district, case_id=case_id)
+    if source_node_id not in nodes or target_node_id not in nodes:
+        raise HTTPException(status_code=404, detail='Trace nodes not found')
+    payload = shortest_graph_path(nodes, edges, source_node_id, target_node_id)
+    payload["source_node"] = nodes[source_node_id]
+    payload["target_node"] = nodes[target_node_id]
+    return payload
+
+
+@app.get('/graph/compare')
+def graph_compare(
+    left_node_id: str,
+    right_node_id: str,
+    district: str | None = None,
+    case_id: int | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    nodes, edges = build_graph_scope(db, district=district, case_id=case_id)
+    if left_node_id not in nodes or right_node_id not in nodes:
+        raise HTTPException(status_code=404, detail='Comparison nodes not found')
+    adjacency = graph_adjacency(edges)
+    left_neighbors = {peer_id for peer_id, _row in adjacency.get(left_node_id, [])}
+    right_neighbors = {peer_id for peer_id, _row in adjacency.get(right_node_id, [])}
+    shared_neighbors = sorted(left_neighbors & right_neighbors)
+    unique_left = sorted(left_neighbors - right_neighbors)
+    unique_right = sorted(right_neighbors - left_neighbors)
+    overlap_ratio = round(len(shared_neighbors) / max(len(left_neighbors | right_neighbors), 1), 3)
+    return {
+        "left_node": nodes[left_node_id],
+        "right_node": nodes[right_node_id],
+        "shared_neighbors": [nodes[row_id] for row_id in shared_neighbors if row_id in nodes],
+        "left_unique_neighbors": [nodes[row_id] for row_id in unique_left if row_id in nodes][:12],
+        "right_unique_neighbors": [nodes[row_id] for row_id in unique_right if row_id in nodes][:12],
+        "overlap_ratio": overlap_ratio,
+        "risk_delta": round(abs(float(nodes[left_node_id].get("risk_score", 0.0)) - float(nodes[right_node_id].get("risk_score", 0.0))), 3),
+    }
+
+
+@app.get('/graph/saved-views')
+def graph_saved_views(
+    district: str | None = None,
+    case_id: int | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(GraphSavedView).filter(GraphSavedView.username == user.username)
+    if district:
+        q = q.filter(or_(GraphSavedView.district == district, GraphSavedView.district == None))
+    if case_id:
+        q = q.filter(or_(GraphSavedView.case_id == case_id, GraphSavedView.case_id == None))
+    rows = q.order_by(GraphSavedView.id.desc()).all()
+    return [
+        {
+            "id": row.id,
+            "username": row.username,
+            "title": row.title,
+            "district": row.district,
+            "case_id": row.case_id,
+            "focus_node_id": row.focus_node_id,
+            "selected_node_ids": json.loads(row.selected_node_ids_json or "[]"),
+            "notes": row.notes,
+            "created_at": row.created_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@app.post('/graph/saved-views')
+def create_graph_saved_view(
+    body: GraphSavedViewCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    row = GraphSavedView(
+        username=user.username,
+        title=body.title,
+        district=body.district,
+        case_id=body.case_id,
+        focus_node_id=body.focus_node_id,
+        selected_node_ids_json=json.dumps(body.selected_node_ids),
+        notes=body.notes,
+    )
+    db.add(row)
+    db.flush()
+    log_action(db, user.username, 'create_graph_saved_view', 'graph_saved_view', str(row.id))
+    db.commit()
+    return {"status": "created", "saved_view_id": row.id}
+
 @app.get('/geo/geofence-alerts')
 def geofence_alerts(district: str | None = None, active: bool | None = None, db: Session = Depends(get_db), user: User = Depends(current_user)):
     q = db.query(GeoFenceAlert)
@@ -909,6 +1418,231 @@ def geofence_alerts(district: str | None = None, active: bool | None = None, db:
     if active is not None: q = q.filter(GeoFenceAlert.active == active)
     rows = q.order_by(GeoFenceAlert.id.desc()).all()
     return [{"id": r.id, "district": r.district, "zone_name": r.zone_name, "alert_type": r.alert_type, "threshold": r.threshold, "active": r.active, "notes": r.notes} for r in rows]
+
+
+@app.get('/geo/boundaries')
+def geo_boundaries(
+    boundary_type: str | None = None,
+    district: str | None = None,
+    station_name: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(GeoBoundary)
+    if boundary_type:
+        q = q.filter(GeoBoundary.boundary_type == boundary_type)
+    if district:
+        q = q.filter(GeoBoundary.district == district)
+    if station_name:
+        q = q.filter(GeoBoundary.station_name == station_name)
+    rows = q.order_by(GeoBoundary.boundary_type, GeoBoundary.district, GeoBoundary.zone_name).all()
+    return [
+        {
+            "id": row.id,
+            "boundary_type": row.boundary_type,
+            "district": row.district,
+            "station_name": row.station_name,
+            "zone_name": row.zone_name,
+            "centroid_latitude": row.centroid_latitude,
+            "centroid_longitude": row.centroid_longitude,
+            "points": json.loads(row.points_json or "[]"),
+            "boundary_rank": row.boundary_rank,
+        }
+        for row in rows
+    ]
+
+
+@app.get('/geo/geofences')
+def geo_geofences(
+    district: str | None = None,
+    station_name: str | None = None,
+    status: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(GeofenceZone)
+    if district:
+        q = q.filter(GeofenceZone.district == district)
+    if station_name:
+        q = q.filter(GeofenceZone.station_name == station_name)
+    if status:
+        q = q.filter(GeofenceZone.status == status)
+    rows = q.order_by(GeofenceZone.id.desc()).all()
+    return [
+        {
+            "id": row.id,
+            "district": row.district,
+            "station_name": row.station_name,
+            "zone_name": row.zone_name,
+            "geofence_type": row.geofence_type,
+            "center_latitude": row.center_latitude,
+            "center_longitude": row.center_longitude,
+            "radius_km": row.radius_km,
+            "points": json.loads(row.points_json or "[]"),
+            "status": row.status,
+            "notes": row.notes,
+            "created_by": row.created_by,
+            "created_at": row.created_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@app.post('/geo/geofences')
+def create_geo_geofence(
+    body: GeofenceZoneCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    row = GeofenceZone(
+        district=body.district,
+        station_name=body.station_name,
+        zone_name=body.zone_name,
+        geofence_type=body.geofence_type,
+        center_latitude=body.center_latitude,
+        center_longitude=body.center_longitude,
+        radius_km=body.radius_km,
+        points_json=build_geo_polygon(body.center_latitude, body.center_longitude, body.radius_km, sides=7),
+        status=body.status,
+        notes=body.notes,
+        created_by=user.username,
+    )
+    db.add(row)
+    db.flush()
+    log_action(db, user.username, 'create_geofence_zone', 'geofence_zone', str(row.id))
+    db.commit()
+    return {"status": "created", "geofence_id": row.id}
+
+
+@app.get('/camera/assets')
+def camera_assets(
+    district: str | None = None,
+    station_id: int | None = None,
+    status: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(CameraAsset)
+    if district:
+        q = q.filter(CameraAsset.district == district)
+    if station_id:
+        q = q.filter(CameraAsset.station_id == station_id)
+    if status:
+        q = q.filter(CameraAsset.status == status)
+    rows = q.order_by(CameraAsset.blind_spot_score.desc(), CameraAsset.health_score.asc()).all()
+    return [
+        {
+            "id": row.id,
+            "camera_id": row.camera_id,
+            "district": row.district,
+            "station_id": row.station_id,
+            "zone_name": row.zone_name,
+            "camera_type": row.camera_type,
+            "status": row.status,
+            "health_score": row.health_score,
+            "blind_spot_score": row.blind_spot_score,
+            "retention_profile": row.retention_profile,
+            "owner_unit": row.owner_unit,
+            "latitude": row.latitude,
+            "longitude": row.longitude,
+            "last_heartbeat_at": row.last_heartbeat_at.isoformat() if row.last_heartbeat_at else None,
+        }
+        for row in rows
+    ]
+
+
+@app.get('/camera/blind-zones')
+def camera_blind_zones(
+    district: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    asset_rows = camera_assets(district=district, user=user, db=db)
+    geofence_rows = geo_geofences(district=district, user=user, db=db)
+    grouped = defaultdict(lambda: {"camera_count": 0, "blind_spot_score": 0.0, "health_pressure": 0.0, "latitude": None, "longitude": None})
+    for row in asset_rows:
+        key = str(row.get("district") or "Statewide")
+        slot = grouped[key]
+        slot["camera_count"] += 1
+        slot["blind_spot_score"] += float(row.get("blind_spot_score", 0.0))
+        slot["health_pressure"] += max(1.0 - float(row.get("health_score", 0.0)), 0.0)
+        if slot["latitude"] is None:
+            slot["latitude"] = row.get("latitude")
+            slot["longitude"] = row.get("longitude")
+    geofence_count = defaultdict(int)
+    for row in geofence_rows:
+        geofence_count[str(row.get("district") or "Statewide")] += 1
+    output = []
+    for district_name, slot in grouped.items():
+        blind_score = round((slot["blind_spot_score"] / max(slot["camera_count"], 1)) + (geofence_count[district_name] * 0.9) + (slot["health_pressure"] * 2.5), 2)
+        output.append(
+            {
+                "district": district_name,
+                "camera_count": slot["camera_count"],
+                "blind_spot_score": blind_score,
+                "geofence_count": geofence_count[district_name],
+                "latitude": slot["latitude"],
+                "longitude": slot["longitude"],
+                "recommended_action": "Rebalance cameras and patrol watch" if blind_score >= 9 else "Maintain current coverage posture",
+            }
+        )
+    return sorted(output, key=lambda row: row["blind_spot_score"], reverse=True)
+
+
+@app.get('/camera/assignments')
+def camera_assignments(
+    district: str | None = None,
+    incident_id: int | None = None,
+    case_id: int | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(CameraIncidentAssignment, CameraAsset).join(CameraAsset, CameraIncidentAssignment.camera_asset_id == CameraAsset.id)
+    if district:
+        q = q.filter(CameraAsset.district == district)
+    if incident_id:
+        q = q.filter(CameraIncidentAssignment.incident_id == incident_id)
+    if case_id:
+        q = q.filter(CameraIncidentAssignment.case_id == case_id)
+    rows = q.order_by(CameraIncidentAssignment.id.desc()).all()
+    return [
+        {
+            "id": assignment.id,
+            "camera_asset_id": assignment.camera_asset_id,
+            "camera_id": asset.camera_id,
+            "district": asset.district,
+            "incident_id": assignment.incident_id,
+            "case_id": assignment.case_id,
+            "assignment_type": assignment.assignment_type,
+            "status": assignment.status,
+            "notes": assignment.notes,
+            "assigned_by": assignment.assigned_by,
+            "created_at": assignment.created_at.isoformat(),
+        }
+        for assignment, asset in rows
+    ]
+
+
+@app.post('/camera/assignments')
+def create_camera_assignment(
+    body: CameraIncidentAssignmentCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    row = CameraIncidentAssignment(
+        camera_asset_id=body.camera_asset_id,
+        incident_id=body.incident_id,
+        case_id=body.case_id,
+        assignment_type=body.assignment_type,
+        status=body.status,
+        notes=body.notes,
+        assigned_by=user.username,
+    )
+    db.add(row)
+    db.flush()
+    log_action(db, user.username, 'assign_camera_incident', 'camera_assignment', str(row.id))
+    db.commit()
+    return {"status": "created", "assignment_id": row.id}
 
 
 
@@ -926,10 +1660,68 @@ def tasks(case_id: int | None = None, district: str | None = None, status: str |
     rows = q.order_by(TaskQueue.id.desc()).all()
     return [{"id": r.id, "case_id": r.case_id, "district": r.district, "task_type": r.task_type, "priority": r.priority, "assigned_unit": r.assigned_unit, "status": r.status, "details": r.details, "created_by": r.created_by} for r in rows]
 
+
+@app.post('/tasks')
+def create_task(
+    body: TaskCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    row = TaskQueue(
+        case_id=body.case_id,
+        district=body.district,
+        task_type=body.task_type,
+        priority=body.priority,
+        assigned_unit=body.assigned_unit,
+        status=body.status,
+        details=body.details,
+        created_by=user.username,
+    )
+    db.add(row)
+    db.flush()
+    db.add(
+        TaskExecution(
+            task_id=row.id,
+            actor=user.username,
+            action="created",
+            notes=f"Task created with status {row.status}. Assigned unit: {row.assigned_unit or 'unassigned'}.",
+        )
+    )
+    log_action(db, user.username, 'create_task', 'task_queue', str(row.id))
+    db.commit()
+    return {"status": "created", "task_id": row.id}
+
 @app.get('/tasks/{task_id}/executions')
 def task_executions(task_id: int, user=Depends(current_user), db: Session = Depends(get_db)):
     rows = db.query(TaskExecution).filter(TaskExecution.task_id == task_id).order_by(TaskExecution.id.desc()).all()
     return [{"id": r.id, "task_id": r.task_id, "actor": r.actor, "action": r.action, "notes": r.notes, "created_at": r.created_at.isoformat()} for r in rows]
+
+
+@app.post('/tasks/{task_id}/actions')
+def task_action(
+    task_id: int,
+    body: TaskActionCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    row = db.query(TaskQueue).filter(TaskQueue.id == task_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail='Task not found')
+    if body.assigned_unit:
+        row.assigned_unit = body.assigned_unit
+    if body.status:
+        row.status = body.status
+    db.add(
+        TaskExecution(
+            task_id=row.id,
+            actor=user.username,
+            action=body.action,
+            notes=body.notes or f"Task action {body.action} recorded.",
+        )
+    )
+    log_action(db, user.username, 'task_action', 'task_queue', str(row.id))
+    db.commit()
+    return {"status": "ok", "task_id": row.id, "task_status": row.status}
 
 @app.get('/suspect-dossiers')
 def suspect_dossiers(district: str | None = None, user=Depends(current_user), db: Session = Depends(get_db)):
@@ -1007,6 +1799,101 @@ def similarity_hits(source_type: str | None = None, user=Depends(current_user), 
     if source_type: q = q.filter(SimilarityHit.source_type == source_type)
     rows = q.order_by(SimilarityHit.similarity_score.desc()).all()
     return [{"id": r.id, "source_type": r.source_type, "source_id": r.source_id, "target_type": r.target_type, "target_id": r.target_id, "similarity_score": r.similarity_score, "rationale": r.rationale} for r in rows]
+
+
+@app.get('/search/unified')
+def unified_search(
+    q: str = Query(..., min_length=1),
+    district: str | None = None,
+    case_id: int | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q_like = f"%{q}%"
+    complaints_q = db.query(Complaint).filter(or_(Complaint.description.ilike(q_like), Complaint.complaint_type.ilike(q_like), Complaint.complainant_ref.ilike(q_like)))
+    cases_q = db.query(Case).filter(or_(Case.title.ilike(q_like), Case.summary.ilike(q_like), Case.created_by.ilike(q_like)))
+    entities_q = db.query(Entity).filter(or_(Entity.display_name.ilike(q_like), Entity.entity_type.ilike(q_like)))
+    watchlists_q = db.query(Watchlist).filter(or_(Watchlist.name.ilike(q_like), Watchlist.rationale.ilike(q_like)))
+    tasks_q = db.query(TaskQueue).filter(or_(TaskQueue.task_type.ilike(q_like), TaskQueue.details.ilike(q_like), TaskQueue.assigned_unit.ilike(q_like)))
+    messages_q = db.query(DepartmentMessage).filter(or_(DepartmentMessage.message_text.ilike(q_like), DepartmentMessage.room_name.ilike(q_like)))
+    checkpoints_q = db.query(CheckpointPlan).filter(or_(CheckpointPlan.checkpoint_name.ilike(q_like), CheckpointPlan.notes.ilike(q_like)))
+    geofences_q = db.query(GeofenceZone).filter(or_(GeofenceZone.zone_name.ilike(q_like), GeofenceZone.notes.ilike(q_like)))
+    cameras_q = db.query(CameraAsset).filter(or_(CameraAsset.camera_id.ilike(q_like), CameraAsset.zone_name.ilike(q_like), CameraAsset.owner_unit.ilike(q_like)))
+
+    if district:
+        complaints_q = complaints_q.filter(Complaint.district == district)
+        cases_q = cases_q.filter(Case.district == district)
+        entities_q = entities_q.filter(Entity.district == district)
+        watchlists_q = watchlists_q.filter(or_(Watchlist.district == district, Watchlist.district == None))
+        tasks_q = tasks_q.filter(TaskQueue.district == district)
+        messages_q = messages_q.filter(or_(DepartmentMessage.district == district, DepartmentMessage.district == None))
+        checkpoints_q = checkpoints_q.filter(CheckpointPlan.district == district)
+        geofences_q = geofences_q.filter(GeofenceZone.district == district)
+        cameras_q = cameras_q.filter(CameraAsset.district == district)
+    if case_id:
+        cases_q = cases_q.filter(Case.id == case_id)
+        tasks_q = tasks_q.filter(or_(TaskQueue.case_id == case_id, TaskQueue.case_id == None))
+        messages_q = messages_q.filter(or_(DepartmentMessage.case_id == case_id, DepartmentMessage.case_id == None))
+        checkpoints_q = checkpoints_q.filter(or_(CheckpointPlan.case_id == case_id, CheckpointPlan.case_id == None))
+
+    similarity_rows = similarity_hits(user=user, db=db)
+    similarity_lookup = defaultdict(float)
+    for row in similarity_rows:
+        similarity_lookup[f"{row['source_type']}:{row['source_id']}"] = max(similarity_lookup[f"{row['source_type']}:{row['source_id']}"], float(row.get("similarity_score", 0.0)))
+        similarity_lookup[f"{row['target_type']}:{row['target_id']}"] = max(similarity_lookup[f"{row['target_type']}:{row['target_id']}"], float(row.get("similarity_score", 0.0)))
+
+    def scored_record(record_type: str, record_id: int | None, district_value: str | None, label: str, base_score: float, payload: dict):
+        similarity_bonus = similarity_lookup.get(f"{record_type}:{record_id}", 0.0)
+        district_bonus = 0.12 if district and district_value == district else 0.0
+        fusion_score = round(base_score + similarity_bonus + district_bonus, 3)
+        return {
+            "record_type": record_type,
+            "record_id": record_id,
+            "district": district_value,
+            "label": label,
+            "fusion_score": fusion_score,
+            "payload": payload,
+        }
+
+    top_hits = []
+    for row in complaints_q.limit(12).all():
+        top_hits.append(scored_record("complaint", row.id, row.district, f"Complaint {row.id}", 0.42, {"complaint_type": row.complaint_type, "status": row.status, "description": row.description}))
+    for row in cases_q.limit(12).all():
+        base_score = 0.55 + (0.15 if row.priority in {"high", "critical"} else 0.0)
+        top_hits.append(scored_record("case", row.id, row.district, row.title, base_score, {"priority": row.priority, "status": row.status, "summary": row.summary}))
+    for row in entities_q.limit(12).all():
+        top_hits.append(scored_record("entity", row.id, row.district, row.display_name, 0.48 + (float(row.risk_score or 0.0) * 0.4), {"entity_type": row.entity_type, "risk_score": row.risk_score}))
+    for row in watchlists_q.limit(10).all():
+        top_hits.append(scored_record("watchlist", row.id, row.district, row.name, 0.58 if row.status == "active" else 0.36, {"watch_type": row.watch_type, "status": row.status, "rationale": row.rationale}))
+    for row in tasks_q.limit(10).all():
+        top_hits.append(scored_record("task", row.id, row.district, row.task_type, 0.44 + (0.16 if row.status in {"approved", "in_progress"} else 0.0), {"priority": row.priority, "status": row.status, "assigned_unit": row.assigned_unit}))
+    for row in messages_q.limit(10).all():
+        top_hits.append(scored_record("message", row.id, row.district, row.room_name, 0.34 + (0.2 if any(name == user.username for name in parse_message_mentions_text(row.message_text)) else 0.0), {"priority": row.priority, "room_name": row.room_name, "message_text": row.message_text}))
+    for row in checkpoints_q.limit(10).all():
+        top_hits.append(scored_record("checkpoint", row.id, row.district, row.checkpoint_name, 0.46 + (0.14 if row.status in {"active", "deployed"} else 0.0), {"checkpoint_type": row.checkpoint_type, "status": row.status, "assigned_unit": row.assigned_unit}))
+    for row in geofences_q.limit(10).all():
+        top_hits.append(scored_record("geofence", row.id, row.district, row.zone_name, 0.39 + (0.18 if row.status == "active" else 0.0), {"geofence_type": row.geofence_type, "status": row.status, "notes": row.notes}))
+    for row in cameras_q.limit(12).all():
+        top_hits.append(scored_record("camera", row.id, row.district, row.camera_id, 0.38 + float(row.blind_spot_score or 0.0) / 25.0, {"camera_type": row.camera_type, "status": row.status, "zone_name": row.zone_name}))
+
+    top_hits = sorted(top_hits, key=lambda row: row["fusion_score"], reverse=True)[:25]
+    return {
+        "query": q,
+        "district": district,
+        "case_id": case_id,
+        "top_hits": top_hits,
+        "counts": {
+            "complaints": complaints_q.count(),
+            "cases": cases_q.count(),
+            "entities": entities_q.count(),
+            "watchlists": watchlists_q.count(),
+            "tasks": tasks_q.count(),
+            "messages": messages_q.count(),
+            "checkpoints": checkpoints_q.count(),
+            "geofences": geofences_q.count(),
+            "cameras": cameras_q.count(),
+        },
+    }
 
 
 

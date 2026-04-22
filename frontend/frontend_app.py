@@ -933,6 +933,140 @@ def build_operational_polygon_svg(
     """
 
 
+def build_boundary_layer_svg(
+    title: str,
+    subtitle: str,
+    boundary_rows: list[dict[str, Any]],
+    geofence_rows: list[dict[str, Any]],
+    checkpoint_rows: list[dict[str, Any]],
+    selected_district: str | None = None,
+    link_getter: Callable[[dict[str, Any]], str | None] | None = None,
+) -> str:
+    width = 980
+    height = 760
+    padding = 70
+    if not boundary_rows and not geofence_rows:
+        return '<div class="tn-inline-note">Boundary and geofence layers are not available for the current selection.</div>'
+
+    geo_points = list(TN_STATE_OUTLINE)
+    for row in boundary_rows + geofence_rows:
+        for point in row.get("points") or []:
+            geo_points.append((to_float(point.get("longitude")), to_float(point.get("latitude"))))
+    min_lon = min(point[0] for point in geo_points)
+    max_lon = max(point[0] for point in geo_points)
+    min_lat = min(point[1] for point in geo_points)
+    max_lat = max(point[1] for point in geo_points)
+
+    outline_points = []
+    for lon, lat in TN_STATE_OUTLINE:
+        x, y = project_geo_point(lon, lat, min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        outline_points.append(f"{x:.1f},{y:.1f}")
+    outline_markup = " ".join(outline_points)
+
+    boundary_palette = {
+        "district": ("rgba(118,183,255,0.12)", "rgba(118,183,255,0.54)"),
+        "station": ("rgba(71,216,154,0.12)", "rgba(71,216,154,0.58)"),
+        "patrol_sector": ("rgba(255,140,66,0.12)", "rgba(255,140,66,0.54)"),
+    }
+    boundary_markup: list[str] = []
+    for row in boundary_rows:
+        points = row.get("points") or []
+        if not points:
+            continue
+        projected = []
+        for point in points:
+            x, y = project_geo_point(
+                to_float(point.get("longitude")),
+                to_float(point.get("latitude")),
+                min_lon,
+                max_lon,
+                min_lat,
+                max_lat,
+                width,
+                height,
+                padding,
+            )
+            projected.append(f"{x:.1f},{y:.1f}")
+        boundary_type = str(row.get("boundary_type") or "district")
+        fill, stroke = boundary_palette.get(boundary_type, ("rgba(157,176,204,0.1)", "rgba(216,230,255,0.45)"))
+        highlighted = selected_district and str(row.get("district")) == selected_district
+        body = (
+            f'<polygon points="{" ".join(projected)}" fill="{fill}" stroke="{"#ffe2bf" if highlighted else stroke}" '
+            f'stroke-width="{"2.8" if highlighted else "1.6"}"><title>{escape(str(row.get("zone_name") or "Boundary"))}</title></polygon>'
+        )
+        centroid_lat = to_float(row.get("centroid_latitude"))
+        centroid_lon = to_float(row.get("centroid_longitude"))
+        if centroid_lat or centroid_lon:
+            x, y = project_geo_point(centroid_lon, centroid_lat, min_lon, max_lon, min_lat, max_lat, width, height, padding)
+            body += (
+                f'<text x="{x:.1f}" y="{y:.1f}" text-anchor="middle" '
+                'style="fill:#eaf2ff;font-size:10.5px;font-family:system-ui,sans-serif;font-weight:650;">'
+                f"{escape(str(row.get('zone_name') or 'Boundary')[:28])}</text>"
+            )
+        if link_getter:
+            boundary_url = link_getter(row)
+            if boundary_url:
+                body = f'<a href="{escape(boundary_url, quote=True)}" target="_top" style="text-decoration:none;">{body}</a>'
+        boundary_markup.append(f"<g>{body}</g>")
+
+    geofence_markup: list[str] = []
+    for row in geofence_rows:
+        points = row.get("points") or []
+        if not points:
+            continue
+        projected = []
+        for point in points:
+            x, y = project_geo_point(
+                to_float(point.get("longitude")),
+                to_float(point.get("latitude")),
+                min_lon,
+                max_lon,
+                min_lat,
+                max_lat,
+                width,
+                height,
+                padding,
+            )
+            projected.append(f"{x:.1f},{y:.1f}")
+        geofence_markup.append(
+            f'<polygon points="{" ".join(projected)}" fill="rgba(255,140,66,0.08)" stroke="rgba(255,140,66,0.72)" stroke-width="1.8" stroke-dasharray="7 5">'
+            f'<title>{escape(str(row.get("zone_name") or "Geofence"))} | {escape(str(row.get("geofence_type") or "watch_zone"))}</title></polygon>'
+        )
+
+    checkpoint_markup: list[str] = []
+    for row in checkpoint_rows:
+        latitude = row.get("latitude")
+        longitude = row.get("longitude")
+        if latitude in (None, "", "N/A") or longitude in (None, "", "N/A"):
+            continue
+        x, y = project_geo_point(to_float(longitude), to_float(latitude), min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        color = "#ff8c42" if str(row.get("status") or "").lower() in {"active", "deployed"} else "#76b7ff"
+        checkpoint_markup.append(
+            f'<polygon points="{build_regular_polygon_points(x, y, 8.5, sides=4, rotation_deg=45)}" fill="{color}" stroke="#f8fbff" stroke-width="1.1">'
+            f'<title>{escape(str(row.get("checkpoint_name") or "Checkpoint"))}</title></polygon>'
+        )
+
+    return f"""
+    <div style="border:1px solid rgba(92,116,151,0.35);border-radius:24px;padding:1rem 1rem 0.7rem 1rem;
+        background:linear-gradient(180deg, rgba(15,25,40,0.98), rgba(10,18,28,0.96));">
+        <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:1rem;flex-wrap:wrap;">
+            <div>
+                <div style="color:#76b7ff;font-size:0.82rem;letter-spacing:0.12em;text-transform:uppercase;font-weight:700;">{escape(title)}</div>
+                <div style="color:#97a8c4;font-size:0.95rem;margin-top:0.25rem;">{escape(subtitle)}</div>
+            </div>
+            <div style="color:#97a8c4;font-size:0.82rem;">District, station, patrol, geofence, and checkpoint layers are stacked together.</div>
+        </div>
+        <svg viewBox="0 0 {width} {height}" style="width:100%;height:auto;margin-top:0.8rem;">
+            <polygon points="{outline_markup}" fill="rgba(118,183,255,0.04)"
+                stroke="rgba(118,183,255,0.35)" stroke-width="3" />
+            {"".join(boundary_markup)}
+            {"".join(geofence_markup)}
+            {"".join(checkpoint_markup)}
+        </svg>
+    </div>
+    """
+
+
 def maybe_send_presence_heartbeat(room_name: str, district_scope: str, status_label: str = "active") -> None:
     now = time.time()
     last_ping = float(st.session_state.get("presence_last_ping_ts", 0.0))
@@ -953,6 +1087,106 @@ def maybe_send_presence_heartbeat(room_name: str, district_scope: str, status_la
         st.session_state.presence_last_ping_ts = now
         st.session_state.presence_last_room = room_name
         st.session_state.presence_last_district = str(payload_district or "")
+
+
+def maybe_send_typing_heartbeat(room_name: str, district_scope: str, case_id: int | None, is_typing: bool) -> None:
+    now = time.time()
+    payload_district = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
+    last_ping = float(st.session_state.get("typing_last_ping_ts", 0.0))
+    last_room = str(st.session_state.get("typing_last_room", ""))
+    active_state = bool(st.session_state.get("typing_active", False))
+    if is_typing:
+        if (now - last_ping) < 7 and active_state and room_name == last_room:
+            return
+        result = api_post(
+            "/internal-comms/typing",
+            payload={
+                "room_name": room_name,
+                "district": payload_district,
+                "case_id": case_id,
+                "is_typing": True,
+            },
+        )
+        if result.get("ok"):
+            st.session_state.typing_last_ping_ts = now
+            st.session_state.typing_last_room = room_name
+            st.session_state.typing_active = True
+    elif active_state:
+        result = api_post(
+            "/internal-comms/typing",
+            payload={
+                "room_name": room_name,
+                "district": payload_district,
+                "case_id": case_id,
+                "is_typing": False,
+            },
+        )
+        if result.get("ok"):
+            st.session_state.typing_active = False
+            st.session_state.typing_last_room = room_name
+
+
+def websocket_api_url() -> str:
+    api_url = get_api_url()
+    if api_url.startswith("https://"):
+        return "wss://" + api_url[len("https://") :]
+    if api_url.startswith("http://"):
+        return "ws://" + api_url[len("http://") :]
+    return api_url
+
+
+def render_war_room_socket_panel(room_name: str, district_scope: str) -> None:
+    token = str(st.session_state.get("token") or "")
+    if not token or not room_name:
+        return
+    district_value = "" if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
+    ws_url = f"{websocket_api_url()}/internal-comms/ws?token={token}&room_name={room_name}&district={district_value}"
+    components.html(
+        f"""
+        <div style="border:1px solid rgba(92,116,151,0.35);border-radius:18px;padding:0.85rem 1rem;background:rgba(10,18,28,0.92);font-family:system-ui,sans-serif;color:#eaf2ff;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:0.8rem;">
+                <div style="font-weight:700;">Socket Monitor</div>
+                <div id="tn-ws-status" style="font-size:0.8rem;color:#97a8c4;">Connecting...</div>
+            </div>
+            <div style="font-size:0.82rem;color:#97a8c4;margin-top:0.35rem;">WebSocket feed for {escape(room_name)}.</div>
+            <div id="tn-ws-events" style="margin-top:0.8rem;display:flex;flex-direction:column;gap:0.55rem;max-height:210px;overflow:auto;"></div>
+        </div>
+        <script>
+        const statusEl = document.getElementById("tn-ws-status");
+        const eventsEl = document.getElementById("tn-ws-events");
+        const ws = new WebSocket("{escape(ws_url, quote=True)}");
+        const renderEvent = (payload) => {{
+            const card = document.createElement("div");
+            card.style.border = "1px solid rgba(92,116,151,0.35)";
+            card.style.borderRadius = "12px";
+            card.style.padding = "0.55rem 0.7rem";
+            card.style.background = "rgba(17,26,39,0.92)";
+            const title = payload.event_type === "message"
+                ? `${{payload.sender_username || "system"}} posted`
+                : payload.event_type === "typing"
+                    ? `${{payload.username || "user"}} is typing`
+                    : payload.event_type;
+            card.innerHTML = `<div style="font-size:0.78rem;color:#76b7ff;font-weight:700;">${{title}}</div><div style="font-size:0.8rem;margin-top:0.2rem;">${{payload.message_text || payload.room_name || ""}}</div>`;
+            eventsEl.prepend(card);
+            while (eventsEl.children.length > 8) {{
+                eventsEl.removeChild(eventsEl.lastChild);
+            }}
+        }};
+        ws.onopen = () => {{ statusEl.textContent = "Connected"; statusEl.style.color = "#47d89a"; }};
+        ws.onmessage = (event) => {{
+            try {{
+                renderEvent(JSON.parse(event.data));
+            }} catch (error) {{
+                renderEvent({{ event_type: "socket", message_text: "Realtime payload received." }});
+            }}
+        }};
+        ws.onerror = () => {{ statusEl.textContent = "Signal degraded"; statusEl.style.color = "#ff8c42"; }};
+        ws.onclose = () => {{ statusEl.textContent = "Disconnected"; statusEl.style.color = "#ff8c42"; }};
+        </script>
+        """,
+        height=320,
+        scrolling=False,
+    )
 
 
 def activate_live_refresh(enabled: bool, interval_seconds: int = 20, component_key: str = "live_refresh") -> None:
@@ -1237,6 +1471,10 @@ def clean_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def rows_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
     return clean_rows(payload_to_rows(result.get("data")))
+
+
+def raw_rows_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
+    return payload_to_rows(result.get("data"))
 
 
 def build_district_map_rows(
@@ -1729,6 +1967,22 @@ def summarize_comms_rooms(message_rows: list[dict[str, Any]]) -> list[dict[str, 
     return sorted(grouped.values(), key=lambda item: str(item.get("latest_activity")), reverse=True)
 
 
+def parse_attachment_manifest(raw_text: str) -> list[dict[str, Any]]:
+    attachments: list[dict[str, Any]] = []
+    for line in str(raw_text or "").splitlines():
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) < 3 or not parts[0] or not parts[2]:
+            continue
+        attachments.append(
+            {
+                "attachment_name": parts[0],
+                "attachment_type": parts[1] or "document",
+                "storage_ref": parts[2],
+            }
+        )
+    return attachments
+
+
 def render_message_feed(rows: list[dict[str, Any]], empty_message: str = "No coordination traffic available.") -> None:
     if not rows:
         st.caption(empty_message)
@@ -1740,6 +1994,8 @@ def render_message_feed(rows: list[dict[str, Any]], empty_message: str = "No coo
         unread_markup = ""
         if bool(row.get("is_unread")):
             unread_markup = '<span class="tn-room-pill">Unread</span>'
+        if bool(row.get("mentions_me")):
+            unread_markup += '<span class="tn-room-pill">Mention</span>'
         meta = " | ".join(
             part for part in [
                 f"{row.get('sender_username', 'unknown')} -> {recipient}",
@@ -1750,12 +2006,25 @@ def render_message_feed(rows: list[dict[str, Any]], empty_message: str = "No coo
             if part
         )
         body = escape(str(row.get("message_text") or ""))
+        attachment_markup = ""
+        attachments = row.get("attachments") or []
+        if isinstance(attachments, list) and attachments:
+            attachment_markup = (
+                '<div style="margin-top:0.55rem;color:#cfe3ff;font-size:0.82rem;"><strong>Attachments:</strong> '
+                + ", ".join(
+                    f"{escape(str(item.get('attachment_name') or 'attachment'))} ({escape(str(item.get('attachment_type') or 'document'))})"
+                    for item in attachments
+                    if isinstance(item, dict)
+                )
+                + "</div>"
+            )
         st.markdown(
             f"""
             <div class="tn-message-card">
                 <div class="tn-message-priority">{escape(priority)} {unread_markup}</div>
                 <div class="tn-message-meta">{escape(meta)}</div>
                 <div>{body}</div>
+                {attachment_markup}
             </div>
             """,
             unsafe_allow_html=True,
@@ -2219,6 +2488,14 @@ def render_geo_command(district_scope: str) -> None:
         params=compact_params({"district": detail_district}) or None,
     )
     geofence_rows = rows_from_result(geofence_result)
+    statewide_boundary_rows = raw_rows_from_result(api_get("/geo/boundaries", params={"boundary_type": "district"}))
+    detail_boundary_rows = raw_rows_from_result(
+        api_get("/geo/boundaries", params=compact_params({"district": detail_district}) or None)
+    )
+    detail_geofence_zone_rows = raw_rows_from_result(
+        api_get("/geo/geofences", params=compact_params({"district": detail_district}) or None)
+    )
+    statewide_geofence_zone_rows = raw_rows_from_result(api_get("/geo/geofences"))
     statewide_hotspot_rows = rows_from_result(api_get("/hotspot-forecasts"))
     statewide_patrol_rows = rows_from_result(api_get("/patrol-coverage"))
     detail_hotspot_rows = rows_from_result(
@@ -2277,8 +2554,13 @@ def render_geo_command(district_scope: str) -> None:
     total_incidents = sum(to_int(row.get("incident_count")) for row in district_map_rows)
     max_intensity = max((to_float(row.get("intensity")) for row in district_map_rows), default=0.0)
     active_geofences = sum(1 for row in geofence_rows if str(row.get("active")).lower() == "yes")
+    active_geofence_zones = sum(1 for row in detail_geofence_zone_rows if str(row.get("status")).lower() == "active")
     total_recommended_cameras = sum(to_int(row.get("recommended_cameras")) for row in cctv_district_rows)
     active_checkpoints = sum(1 for row in statewide_checkpoint_rows if str(row.get("status")).lower() in {"active", "deployed"})
+    visible_boundary_rows = list(statewide_boundary_rows)
+    for row in detail_boundary_rows:
+        if row not in visible_boundary_rows:
+            visible_boundary_rows.append(row)
     render_metric_grid(
         [
             ("Districts Mapped", len(district_map_rows)),
@@ -2295,6 +2577,9 @@ def render_geo_command(district_scope: str) -> None:
             ("Filtered Incidents", len(incident_rows)),
             ("Geofence Alerts", len(geofence_rows)),
             ("Active Geofences", active_geofences),
+            ("Boundary Layers", len(visible_boundary_rows)),
+            ("Editable Geofences", len(detail_geofence_zone_rows) or len(statewide_geofence_zone_rows)),
+            ("Active Geo Zones", active_geofence_zones),
         ]
     )
 
@@ -2584,15 +2869,16 @@ def render_geo_command(district_scope: str) -> None:
 
     with tabs[5]:
         render_inline_note(
-            "Operational GIS polygons represent planning sectors for surveillance, interception, and patrol coordination. They are planning geometry, not official legal jurisdiction boundaries."
+            "Boundary layers now stack district, station, and patrol-sector geometry with editable geofences and checkpoint planning. These remain operational planning layers rather than legal cadastral maps."
         )
         gis_left, gis_right = st.columns([1.15, 0.85])
         with gis_left:
             render_geo_html(
-                build_operational_polygon_svg(
-                    "Operational GIS Sector Map",
-                    "District polygons scale with operational intensity. Checkpoint diamonds show planned or active interception points.",
-                    selected_district_map_rows,
+                build_boundary_layer_svg(
+                    "Operational Boundary and Geofence Map",
+                    "District, station, patrol-sector, geofence, and checkpoint layers are aligned in one editable planning surface.",
+                    visible_boundary_rows,
+                    detail_geofence_zone_rows or statewide_geofence_zone_rows,
                     statewide_checkpoint_rows,
                     selected_district=detail_district,
                     link_getter=district_link_getter,
@@ -2605,6 +2891,18 @@ def render_geo_command(district_scope: str) -> None:
                 detail_checkpoint_rows or statewide_checkpoint_rows,
                 caption="Checkpoint plans in the active district lens, including route assignment, status, unit, and notes.",
                 limit=18,
+            )
+            render_table(
+                "Boundary Registry",
+                detail_boundary_rows or statewide_boundary_rows,
+                caption="District, station, and patrol-sector boundary rows visible to the active lens.",
+                limit=18,
+            )
+            render_table(
+                "Editable Geofences",
+                detail_geofence_zone_rows or statewide_geofence_zone_rows,
+                caption="Operational geofence zones with geometry, status, and district alignment.",
+                limit=12,
             )
             with st.expander("Create checkpoint plan", expanded=False):
                 route_choices = ["None"] + list(route_option_map.keys())
@@ -2635,6 +2933,35 @@ def render_geo_command(district_scope: str) -> None:
                             "/checkpoint-plans",
                             payload=payload,
                             success_message="Checkpoint plan created.",
+                        )
+            with st.expander("Create editable geofence", expanded=False):
+                station_options = ["Unspecified"] + sorted({str(row.get("station_name")) for row in station_map_rows if row.get("station_name")})
+                district_row = next((row for row in district_map_rows if str(row.get("district")) == str(detail_district)), {})
+                with st.form("geofence_zone_form"):
+                    zone_name = st.text_input("Zone name")
+                    geofence_type = st.selectbox("Geofence type", ["watch_zone", "movement_watch", "high_watch", "device_sweep", "camera_priority"], index=0)
+                    station_name = st.selectbox("Station anchor", station_options, index=0)
+                    center_lat = st.text_input("Center latitude", value=str(district_row.get("latitude") or ""))
+                    center_lon = st.text_input("Center longitude", value=str(district_row.get("longitude") or ""))
+                    radius_km = st.slider("Radius (km)", 1.0, 12.0, 3.5, 0.5)
+                    zone_status = st.selectbox("Zone status", ["active", "planned", "paused"], index=0)
+                    zone_notes = st.text_area("Zone notes", height=100)
+                    if st.form_submit_button("Create geofence zone", use_container_width=True):
+                        payload = {
+                            "district": detail_district or district_scope,
+                            "zone_name": zone_name,
+                            "geofence_type": geofence_type,
+                            "station_name": None if station_name == "Unspecified" else station_name,
+                            "center_latitude": to_float(center_lat),
+                            "center_longitude": to_float(center_lon),
+                            "radius_km": radius_km,
+                            "status": zone_status,
+                            "notes": zone_notes or None,
+                        }
+                        run_action_and_refresh(
+                            "/geo/geofences",
+                            payload=payload,
+                            success_message="Geofence zone created.",
                         )
 
     with tabs[6]:
@@ -2731,6 +3058,17 @@ def render_graph_fabric(district_scope: str, selected_case_id: int | None) -> No
         district_scope=district_scope,
         selected_node_id=selected_node_id,
     )
+    saved_view_rows = raw_rows_from_result(
+        api_get(
+            "/graph/saved-views",
+            params=compact_params(
+                {
+                    "district": None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope,
+                    "case_id": selected_case_id,
+                }
+            ) or None,
+        )
+    )
     node_link_getter = lambda row: build_query_url({"ops_node": row.get("id")})
     selected_node = payload.get("selected_node") or {}
 
@@ -2756,55 +3094,220 @@ def render_graph_fabric(district_scope: str, selected_case_id: int | None) -> No
         ]
     )
 
-    graph_left, graph_right = st.columns([1.2, 0.8])
-    with graph_left:
-        render_geo_html(
-            build_graph_svg(
-                "Entity Graph Canvas",
-                "Click nodes to refocus the graph around a suspect, vehicle, case, or evidence object.",
-                payload.get("nodes", []),
-                payload.get("edges", []),
-                selected_node_id=payload.get("selected_node_id"),
-                link_getter=node_link_getter,
-            ),
-            height=920,
-        )
-    with graph_right:
-        render_table(
-            "Selected Node",
-            [selected_node] if selected_node else [],
-            caption="Attributes for the currently selected graph node.",
-            limit=1,
-        )
-        render_table(
-            "Linked Neighbors",
-            payload.get("linked_rows", []),
-            caption="Immediate relationships and linked peers for the focused node.",
-            limit=20,
-        )
-        if case_graph_payload:
+    tabs = st.tabs(["Canvas", "Expand", "Trace and Compare", "Saved Views"])
+    with tabs[0]:
+        graph_left, graph_right = st.columns([1.2, 0.8])
+        with graph_left:
+            render_geo_html(
+                build_graph_svg(
+                    "Entity Graph Canvas",
+                    "Click nodes to refocus the graph around a suspect, vehicle, case, or evidence object.",
+                    payload.get("nodes", []),
+                    payload.get("edges", []),
+                    selected_node_id=payload.get("selected_node_id"),
+                    link_getter=node_link_getter,
+                ),
+                height=920,
+            )
+        with graph_right:
             render_table(
-                "Case Graph Snapshot",
-                [case_graph_payload.get("snapshot", {})] if case_graph_payload.get("snapshot") else [],
-                caption="Current case graph density and summary for the active case lens.",
+                "Selected Node",
+                [selected_node] if selected_node else [],
+                caption="Attributes for the currently selected graph node.",
                 limit=1,
             )
+            render_table(
+                "Linked Neighbors",
+                payload.get("linked_rows", []),
+                caption="Immediate relationships and linked peers for the focused node.",
+                limit=20,
+            )
+            if case_graph_payload:
+                render_table(
+                    "Case Graph Snapshot",
+                    [case_graph_payload.get("snapshot", {})] if case_graph_payload.get("snapshot") else [],
+                    caption="Current case graph density and summary for the active case lens.",
+                    limit=1,
+                )
 
-    lower_left, lower_right = st.columns(2)
-    with lower_left:
-        render_table(
-            "Entity Registry",
-            sorted(entity_rows, key=lambda row: to_float(row.get("risk_score")), reverse=True),
-            caption="Entity registry rows available in the current scope.",
-            limit=25,
+        lower_left, lower_right = st.columns(2)
+        with lower_left:
+            render_table(
+                "Entity Registry",
+                sorted(entity_rows, key=lambda row: to_float(row.get("risk_score")), reverse=True),
+                caption="Entity registry rows available in the current scope.",
+                limit=25,
+            )
+        with lower_right:
+            render_table(
+                "Graph Edge Ledger",
+                payload.get("edges", []),
+                caption="Visible graph links currently rendered on the canvas.",
+                limit=25,
+            )
+
+    with tabs[1]:
+        depth = st.slider("Expansion depth", 1, 3, 2, key="graph_expand_depth")
+        expand_result = api_get(
+            "/graph/expand",
+            params=compact_params(
+                {
+                    "node_id": selected_node_id,
+                    "district": None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope,
+                    "case_id": selected_case_id,
+                    "depth": depth,
+                }
+            ) or None,
         )
-    with lower_right:
-        render_table(
-            "Graph Edge Ledger",
-            payload.get("edges", []),
-            caption="Visible graph links currently rendered on the canvas.",
-            limit=25,
-        )
+        if expand_result.get("ok") and isinstance(expand_result.get("data"), dict):
+            expand_payload = expand_result["data"]
+            expand_left, expand_right = st.columns([1.15, 0.85])
+            with expand_left:
+                render_geo_html(
+                    build_graph_svg(
+                        "Expanded Neighborhood",
+                        "Neighborhood expansion grows outward from the focused node to reveal related entities and case-linked objects.",
+                        payload_to_rows(expand_payload.get("nodes")),
+                        payload_to_rows(expand_payload.get("edges")),
+                        selected_node_id=str((expand_payload.get("center_node") or {}).get("id") or selected_node_id),
+                        link_getter=node_link_getter,
+                    ),
+                    height=920,
+                )
+            with expand_right:
+                render_table(
+                    "Expanded Nodes",
+                    payload_to_rows(expand_payload.get("nodes")),
+                    caption="Nodes revealed at the selected expansion depth.",
+                    limit=24,
+                )
+                render_table(
+                    "Expanded Edges",
+                    payload_to_rows(expand_payload.get("edges")),
+                    caption="Edges participating in the expanded neighborhood.",
+                    limit=24,
+                )
+        else:
+            render_result_error(expand_result, "Graph Expansion")
+
+    with tabs[2]:
+        compare_options = {label: value for label, value in option_map.items() if value != selected_node_id}
+        selected_compare_node = None
+        if compare_options:
+            selected_compare_label = st.selectbox("Trace and compare with", list(compare_options.keys()), key="graph_compare_node")
+            selected_compare_node = compare_options.get(selected_compare_label)
+
+        if selected_compare_node:
+            trace_result = api_get(
+                "/graph/trace",
+                params=compact_params(
+                    {
+                        "source_node_id": selected_node_id,
+                        "target_node_id": selected_compare_node,
+                        "district": None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope,
+                        "case_id": selected_case_id,
+                    }
+                ) or None,
+            )
+            compare_result = api_get(
+                "/graph/compare",
+                params=compact_params(
+                    {
+                        "left_node_id": selected_node_id,
+                        "right_node_id": selected_compare_node,
+                        "district": None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope,
+                        "case_id": selected_case_id,
+                    }
+                ) or None,
+            )
+            compare_left, compare_right = st.columns([1.08, 0.92])
+            with compare_left:
+                if trace_result.get("ok") and isinstance(trace_result.get("data"), dict):
+                    trace_payload = trace_result["data"]
+                    render_metric_grid(
+                        [
+                            ("Path Found", "Yes" if trace_payload.get("path_found") else "No"),
+                            ("Hop Count", trace_payload.get("hop_count", 0)),
+                        ]
+                    )
+                    render_geo_html(
+                        build_graph_svg(
+                            "Shortest Trace Path",
+                            "The trace path highlights the shortest graph route between the two selected nodes.",
+                            payload_to_rows(trace_payload.get("path_nodes")),
+                            payload_to_rows(trace_payload.get("path_edges")),
+                            selected_node_id=selected_node_id,
+                            link_getter=node_link_getter,
+                        ),
+                        height=860,
+                    )
+                else:
+                    render_result_error(trace_result, "Graph Trace")
+            with compare_right:
+                if compare_result.get("ok") and isinstance(compare_result.get("data"), dict):
+                    compare_payload = compare_result["data"]
+                    render_metric_grid(
+                        [
+                            ("Overlap Ratio", compare_payload.get("overlap_ratio", 0)),
+                            ("Risk Delta", compare_payload.get("risk_delta", 0)),
+                            ("Shared Neighbors", len(payload_to_rows(compare_payload.get("shared_neighbors")))),
+                        ]
+                    )
+                    render_table(
+                        "Shared Neighbors",
+                        payload_to_rows(compare_payload.get("shared_neighbors")),
+                        caption="Neighbors shared by both selected nodes.",
+                        limit=18,
+                    )
+                    render_table(
+                        "Left-Unique Neighbors",
+                        payload_to_rows(compare_payload.get("left_unique_neighbors")),
+                        caption="Neighbors only linked to the focused left-hand node.",
+                        limit=12,
+                    )
+                    render_table(
+                        "Right-Unique Neighbors",
+                        payload_to_rows(compare_payload.get("right_unique_neighbors")),
+                        caption="Neighbors only linked to the comparison node.",
+                        limit=12,
+                    )
+                else:
+                    render_result_error(compare_result, "Graph Compare")
+
+    with tabs[3]:
+        view_left, view_right = st.columns([1.0, 1.0])
+        with view_left:
+            render_table(
+                "Saved Views",
+                saved_view_rows,
+                caption="Saved graph workbench states for the current analyst.",
+                limit=18,
+            )
+            if saved_view_rows:
+                view_option_map = {f"{row.get('title')} | {row.get('district') or 'statewide'}": row for row in saved_view_rows}
+                selected_saved_view = st.selectbox("Apply saved view", list(view_option_map.keys()), key="graph_saved_view_select")
+                chosen_view = view_option_map[selected_saved_view]
+                if st.button("Load focus node", use_container_width=True, key="graph_saved_view_apply"):
+                    set_query_param("ops_node", chosen_view.get("focus_node_id"))
+                    st.rerun()
+        with view_right:
+            with st.form("graph_saved_view_form"):
+                view_title = st.text_input("Saved view title")
+                view_notes = st.text_area("Saved view notes", height=120)
+                if st.form_submit_button("Save current view", use_container_width=True):
+                    submit_payload = {
+                        "title": view_title,
+                        "district": None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope,
+                        "case_id": selected_case_id,
+                        "focus_node_id": selected_node_id,
+                        "selected_node_ids": [row.get("id") for row in payload.get("nodes", []) if row.get("id")],
+                        "notes": view_notes or None,
+                    }
+                    run_action_and_refresh(
+                        "/graph/saved-views",
+                        payload=submit_payload,
+                        success_message="Graph view saved.",
+                    )
 
 
 def render_war_room(
@@ -2840,9 +3343,15 @@ def render_war_room(
     activate_live_refresh(live_updates, interval_seconds=18, component_key="war_room_live_refresh")
     maybe_send_presence_heartbeat(selected_room, district_scope, status_label="war_room")
 
-    message_rows = rows_from_result(
+    message_rows = raw_rows_from_result(
         api_get(
             "/internal-comms/messages",
+            params=compact_params({"district": district_param, "room_name": selected_room}) or None,
+        )
+    )
+    typing_rows = raw_rows_from_result(
+        api_get(
+            "/internal-comms/typing",
             params=compact_params({"district": district_param, "room_name": selected_room}) or None,
         )
     )
@@ -2868,13 +3377,14 @@ def render_war_room(
             ("Online Personnel", online_count),
             ("Room Unread", selected_room_row.get("unread_count", 0)),
             ("Messages in Thread", len(message_rows)),
+            ("Typing Signals", len(typing_rows)),
             ("Checkpoint Plans", len(checkpoint_rows)),
             ("Active Checkpoints", active_checkpoints),
             ("War-Room Snapshots", len(snapshot_rows)),
         ]
     )
 
-    tabs = st.tabs(["Operations", "Live Chat", "Action Planner"])
+    tabs = st.tabs(["Operations", "Live Chat", "Realtime Signals", "Action Planner"])
     with tabs[0]:
         ops_left, ops_right = st.columns([1.08, 0.92])
         with ops_left:
@@ -2903,6 +3413,12 @@ def render_war_room(
                 caption="Current checkpoint actions visible to the active district scope.",
                 limit=12,
             )
+            render_table(
+                "Active Typing Signals",
+                typing_rows,
+                caption="Personnel currently drafting or actively signaling in the selected room.",
+                limit=12,
+            )
 
     with tabs[1]:
         chat_left, chat_right = st.columns([1.18, 0.82])
@@ -2916,27 +3432,71 @@ def render_war_room(
                     )
             render_message_feed(message_rows, empty_message="No war-room traffic has been posted yet.")
         with chat_right:
-            with st.form("war_room_message_form"):
-                channel_scope = st.selectbox("Channel scope", ["statewide", "district", "direct", "case"], index=1 if district_scope != DEFAULT_DISTRICT_SCOPE else 0)
-                recipient_choices = ["None"] + [str(row.get("username")) for row in presence_rows if str(row.get("username")) != str(me_payload.get("username") or st.session_state.get("username"))]
-                recipient_username = st.selectbox("Direct recipient", recipient_choices, index=0, disabled=channel_scope != "direct")
-                priority = st.selectbox("Priority", ["routine", "medium", "high", "critical"], index=1)
-                ack_required = st.checkbox("Acknowledge required", value=True)
-                message_text = st.text_area("Post to war-room thread", height=130)
-                if st.form_submit_button("Post message", use_container_width=True):
-                    payload = {
-                        "room_name": selected_room or "State Command Net",
-                        "message_text": message_text,
-                        "channel_scope": channel_scope,
-                        "district": district_param if channel_scope in {"district", "case"} else None,
-                        "recipient_username": None if recipient_username == "None" or channel_scope != "direct" else recipient_username,
-                        "priority": priority,
-                        "ack_required": ack_required,
-                        "case_id": selected_case_id if channel_scope == "case" else None,
-                    }
-                    run_action_and_refresh("/internal-comms/messages", payload=payload, success_message="War-room message posted.")
+            render_war_room_socket_panel(selected_room, district_scope)
+            channel_scope = st.selectbox("Channel scope", ["statewide", "district", "direct", "case"], index=1 if district_scope != DEFAULT_DISTRICT_SCOPE else 0, key="war_room_channel_scope")
+            recipient_choices = ["None"] + [str(row.get("username")) for row in presence_rows if str(row.get("username")) != str(me_payload.get("username") or st.session_state.get("username"))]
+            recipient_username = st.selectbox("Direct recipient", recipient_choices, index=0, disabled=channel_scope != "direct", key="war_room_recipient")
+            priority = st.selectbox("Priority", ["routine", "medium", "high", "critical"], index=1, key="war_room_priority")
+            ack_required = st.checkbox("Acknowledge required", value=True, key="war_room_ack_required")
+            mention_choices = [str(row.get("username")) for row in presence_rows if str(row.get("username")) != str(me_payload.get("username") or st.session_state.get("username"))]
+            mentioned_usernames = st.multiselect("Mention personnel", mention_choices, key="war_room_mentions")
+            attachment_manifest = st.text_area(
+                "Attachments (name|type|storage_ref per line)",
+                height=90,
+                key="war_room_attachment_manifest",
+                placeholder="checkpoint-plan.pdf|document|storage://war-room/checkpoint-plan\ncorridor-map.png|image|storage://war-room/corridor-map",
+            )
+            message_text = st.text_area("Post to war-room thread", height=130, key="war_room_message_draft")
+            maybe_send_typing_heartbeat(selected_room, district_scope, selected_case_id, bool(str(message_text).strip()))
+            if st.button("Post message", use_container_width=True, key="war_room_post_submit"):
+                full_message_text = str(message_text or "").strip()
+                if mentioned_usernames:
+                    mention_prefix = " ".join(f"@{username}" for username in mentioned_usernames)
+                    full_message_text = f"{mention_prefix} {full_message_text}".strip()
+                payload = {
+                    "room_name": selected_room or "State Command Net",
+                    "message_text": full_message_text,
+                    "channel_scope": channel_scope,
+                    "district": district_param if channel_scope in {"district", "case"} else None,
+                    "recipient_username": None if recipient_username == "None" or channel_scope != "direct" else recipient_username,
+                    "priority": priority,
+                    "ack_required": ack_required,
+                    "case_id": selected_case_id if channel_scope == "case" else None,
+                    "attachments": parse_attachment_manifest(attachment_manifest),
+                }
+                st.session_state.war_room_message_draft = ""
+                st.session_state.war_room_attachment_manifest = ""
+                st.session_state.war_room_mentions = []
+                maybe_send_typing_heartbeat(selected_room, district_scope, selected_case_id, False)
+                run_action_and_refresh("/internal-comms/messages", payload=payload, success_message="War-room message posted.")
 
     with tabs[2]:
+        signal_left, signal_right = st.columns([1.0, 1.0])
+        with signal_left:
+            render_table(
+                "Typing Board",
+                typing_rows,
+                caption="Active typing and drafting signals in the selected war-room thread.",
+                limit=16,
+            )
+            render_table(
+                "Presence Board",
+                presence_rows,
+                caption="Online status, room posture, and district scope for visible personnel.",
+                limit=16,
+            )
+        with signal_right:
+            render_table(
+                "Room Summary",
+                room_rows,
+                caption="Unread sync, room load, and latest activity across war-room channels.",
+                limit=16,
+            )
+            render_inline_note(
+                "Socket monitor provides live event awareness in the selected room. Streamlit still refreshes the wider workspace on the configured live-update cadence so the rest of the board stays synchronized."
+            )
+
+    with tabs[3]:
         planner_left, planner_right = st.columns([1.08, 0.92])
         with planner_left:
             render_geo_html(
@@ -3659,7 +4219,7 @@ def render_department_comms(
     else:
         selected_room = None
 
-    message_rows = rows_from_result(
+    message_rows = raw_rows_from_result(
         api_get(
             "/internal-comms/messages",
             params=compact_params(
@@ -3764,6 +4324,11 @@ def render_department_comms(
             )
             priority = st.selectbox("Priority", ["routine", "medium", "high", "critical"], index=0)
             ack_required = st.checkbox("Acknowledge required")
+            attachment_manifest = st.text_area(
+                "Attachments (name|type|storage_ref per line)",
+                height=90,
+                placeholder="briefing.pdf|document|storage://briefings/tn-01",
+            )
             message_text = st.text_area("Message", height=140, placeholder="Type the operational instruction, coordination note, or escalation context.")
             if st.form_submit_button("Send message", use_container_width=True):
                 room_name = custom_room.strip() if compose_room == "Custom Room" else compose_room
@@ -3776,6 +4341,7 @@ def render_department_comms(
                     "priority": priority,
                     "ack_required": ack_required,
                     "case_id": selected_case_id if channel_scope == "case" else None,
+                    "attachments": parse_attachment_manifest(attachment_manifest),
                 }
                 run_action_and_refresh(
                     "/internal-comms/messages",
@@ -3925,6 +4491,263 @@ def render_tasking_and_exports(district_scope: str, selected_case_id: int | None
             render_result_error(audit_result, "Audit Trail")
 
 
+def render_camera_command(district_scope: str, selected_case_id: int | None) -> None:
+    district_param = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
+    asset_rows = rows_from_result(api_get("/camera/assets", params=compact_params({"district": district_param}) or None))
+    blind_rows = rows_from_result(api_get("/camera/blind-zones", params=compact_params({"district": district_param}) or None))
+    incident_rows = rows_from_result(api_get("/incidents", params=compact_params({"district": district_param}) or None))
+    assignment_rows = rows_from_result(
+        api_get("/camera/assignments", params=compact_params({"district": district_param, "case_id": selected_case_id}) or None)
+    )
+
+    degraded_assets = [row for row in asset_rows if str(row.get("status")).lower() in {"degraded", "maintenance"}]
+    linked_assignments = [row for row in assignment_rows if str(row.get("status")).lower() in {"linked", "active"}]
+
+    render_hero(
+        "Camera Command",
+        "Camera registry, blind-zone posture, device health, and incident-linked camera lookup aligned in one surveillance operations workspace.",
+        eyebrow="Camera Operations Center",
+        chips=[
+            f"District scope: {district_scope}",
+            f"Case focus: {selected_case_id if selected_case_id is not None else 'none'}",
+            f"Assets: {len(asset_rows)}",
+            f"Blind zones: {len(blind_rows)}",
+        ],
+    )
+    render_metric_grid(
+        [
+            ("Camera Assets", len(asset_rows)),
+            ("Degraded or Maintenance", len(degraded_assets)),
+            ("Blind-Zone Districts", len(blind_rows)),
+            ("Linked Camera Assignments", len(linked_assignments)),
+        ]
+    )
+
+    tabs = st.tabs(["Registry", "Blind Zones", "Incident Lookup"])
+    with tabs[0]:
+        registry_left, registry_right = st.columns([1.14, 0.86])
+        with registry_left:
+            if asset_rows:
+                render_geo_html(
+                    build_geo_svg(
+                        "Camera Registry Map",
+                        "Camera assets are plotted by location, with intensity reflecting blind-spot pressure and coverage importance.",
+                        asset_rows,
+                        point_label_key="camera_id",
+                        intensity_key="blind_spot_score",
+                        value_key="health_score",
+                        coverage_key="blind_spot_score",
+                        show_labels=False,
+                    ),
+                    height=920,
+                )
+            else:
+                render_inline_note("Camera assets are not available for the active district scope.")
+        with registry_right:
+            render_table(
+                "Camera Registry",
+                asset_rows,
+                caption="Camera asset registry with type, health, blind-spot score, retention, and owner unit.",
+                limit=24,
+            )
+            render_table(
+                "Degraded Assets",
+                degraded_assets,
+                caption="Devices needing maintenance, rebalancing, or heartbeat review.",
+                limit=12,
+            )
+
+    with tabs[1]:
+        blind_left, blind_right = st.columns([1.1, 0.9])
+        with blind_left:
+            if blind_rows:
+                render_geo_html(
+                    build_geo_svg(
+                        "Blind-Zone Heatmap",
+                        "Blind-zone intensity blends camera posture, health pressure, and active geofence count.",
+                        blind_rows,
+                        point_label_key="district",
+                        selected_label=None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope,
+                        intensity_key="blind_spot_score",
+                        value_key="camera_count",
+                        coverage_key="geofence_count",
+                    ),
+                    height=920,
+                )
+            else:
+                render_inline_note("Blind-zone heatmap appears once camera registry rows are available.")
+        with blind_right:
+            render_table(
+                "Blind-Zone Registry",
+                blind_rows,
+                caption="District blind-zone pressure and recommended surveillance action.",
+                limit=16,
+            )
+            render_table(
+                "Linked Assignments",
+                linked_assignments,
+                caption="Current camera-to-incident and camera-to-case links.",
+                limit=14,
+            )
+
+    with tabs[2]:
+        incident_option_map = {
+            f"Incident {row.get('id')} | {row.get('district')} | {row.get('category')}": to_int(row.get("id"))
+            for row in incident_rows
+            if row.get("id") not in (None, "N/A")
+        }
+        selected_incident_id = None
+        if incident_option_map:
+            selected_incident_label = st.selectbox("Incident lens", list(incident_option_map.keys()), key="camera_incident_lens")
+            selected_incident_id = incident_option_map[selected_incident_label]
+        scoped_assignment_rows = [
+            row for row in assignment_rows
+            if selected_incident_id is None or to_int(row.get("incident_id")) == selected_incident_id
+        ]
+        lookup_left, lookup_right = st.columns([1.0, 1.0])
+        with lookup_left:
+            render_table(
+                "Incident-Linked Cameras",
+                scoped_assignment_rows,
+                caption="Camera assets currently linked to the active incident or case lens.",
+                limit=16,
+            )
+        with lookup_right:
+            camera_option_map = {f"{row.get('camera_id')} | {row.get('camera_type')} | {row.get('district')}": to_int(row.get("id")) for row in asset_rows}
+            with st.form("camera_assignment_form"):
+                selected_camera_label = st.selectbox("Camera asset", list(camera_option_map.keys()), key="camera_assignment_asset") if camera_option_map else None
+                assignment_type = st.selectbox("Assignment type", ["primary_coverage", "incident_cover", "checkpoint_watch", "suspect_route_watch"], index=0)
+                assignment_status = st.selectbox("Status", ["linked", "active", "review", "closed"], index=0)
+                assignment_notes = st.text_area("Assignment notes", height=110)
+                if st.form_submit_button("Link camera to incident", use_container_width=True, disabled=not camera_option_map):
+                    payload = {
+                        "camera_asset_id": camera_option_map[selected_camera_label],
+                        "incident_id": selected_incident_id,
+                        "case_id": selected_case_id,
+                        "assignment_type": assignment_type,
+                        "status": assignment_status,
+                        "notes": assignment_notes or None,
+                    }
+                    run_action_and_refresh("/camera/assignments", payload=payload, success_message="Camera assignment created.")
+
+
+def render_dispatch_engine(district_scope: str, selected_case_id: int | None, me_payload: dict[str, Any]) -> None:
+    district_param = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
+    task_rows = rows_from_result(api_get("/tasks", params=compact_params({"district": district_param, "case_id": selected_case_id}) or None))
+    checkpoint_rows = rows_from_result(api_get("/checkpoint-plans", params=compact_params({"district": district_param, "case_id": selected_case_id}) or None))
+    case_rows = rows_from_result(api_get("/cases"))
+    district_rows = build_district_map_rows(rows_from_result(api_get("/geo/district-heatmap")))
+    cluster_rows = rows_from_result(api_get("/fusion/clusters"))
+    suspect_rows = rows_from_result(api_get("/suspect-dossiers"))
+    route_rows = build_route_rows(district_rows, build_movement_flow_rows(district_rows, cluster_rows), suspect_rows, case_rows)
+
+    queued_tasks = [row for row in task_rows if str(row.get("status")).lower() == "queued"]
+    approved_tasks = [row for row in task_rows if str(row.get("status")).lower() == "approved"]
+    active_tasks = [row for row in task_rows if str(row.get("status")).lower() in {"in_progress", "deployed"}]
+    completed_tasks = [row for row in task_rows if str(row.get("status")).lower() in {"completed", "closed"}]
+
+    render_hero(
+        "Dispatch Engine",
+        "Assignment, approval, execution, and closure workflow for operational actions tied to tasks, checkpoints, routes, and case context.",
+        eyebrow="Action Workflow Engine",
+        chips=[
+            f"District scope: {district_scope}",
+            f"Case focus: {selected_case_id if selected_case_id is not None else 'none'}",
+            f"Tasks: {len(task_rows)}",
+            f"Checkpoints: {len(checkpoint_rows)}",
+        ],
+    )
+    render_metric_grid(
+        [
+            ("Queued", len(queued_tasks)),
+            ("Approved", len(approved_tasks)),
+            ("Active", len(active_tasks)),
+            ("Completed", len(completed_tasks)),
+            ("Checkpoint Actions", len(checkpoint_rows)),
+        ]
+    )
+
+    tabs = st.tabs(["Workflow Board", "Assignments and Approvals", "Closure Timeline"])
+    with tabs[0]:
+        board_left, board_right = st.columns([1.0, 1.0])
+        with board_left:
+            render_table("Queued Tasks", queued_tasks, caption="Tasks awaiting assignment, approval, or dispatch action.", limit=16)
+            render_table("Active Tasks", active_tasks, caption="Tasks currently executing or deployed.", limit=16)
+        with board_right:
+            render_table("Approved Tasks", approved_tasks, caption="Tasks cleared for field execution.", limit=16)
+            render_table("Checkpoint Workflow", checkpoint_rows, caption="Checkpoint actions participating in the current workflow lens.", limit=16)
+
+        route_option_map = {f"{row.get('subject_label')} | {row.get('route_type')}": row for row in route_rows}
+        with st.expander("Create workflow task", expanded=False):
+            with st.form("dispatch_create_task_form"):
+                task_type = st.text_input("Task type", value="checkpoint_deployment")
+                priority = st.selectbox("Priority", ["low", "medium", "high", "critical"], index=2)
+                assigned_unit = st.text_input("Assigned unit", value=str(me_payload.get("district") or "State Command Cell"))
+                route_label = st.selectbox("Route context", ["None"] + list(route_option_map.keys()), index=0)
+                details = st.text_area("Task details", height=110)
+                if st.form_submit_button("Create workflow task", use_container_width=True):
+                    route_context = None if route_label == "None" else route_option_map[route_label]
+                    full_details = details
+                    if route_context:
+                        full_details = (full_details + "\n" if full_details else "") + f"Route context: {route_context.get('route_id')} | {route_context.get('subject_label')}"
+                    payload = {
+                        "district": district_scope if district_scope != DEFAULT_DISTRICT_SCOPE else (route_context.get("districts", ["Statewide"])[0] if route_context else "Statewide"),
+                        "task_type": task_type,
+                        "priority": priority,
+                        "assigned_unit": assigned_unit or None,
+                        "status": "queued",
+                        "details": full_details or None,
+                        "case_id": selected_case_id,
+                    }
+                    run_action_and_refresh("/tasks", payload=payload, success_message="Workflow task created.")
+
+    with tabs[1]:
+        task_option_map = {
+            f"Task {row.get('id')} | {row.get('task_type')} | {row.get('status')}": to_int(row.get("id"))
+            for row in task_rows
+            if row.get("id") not in (None, "N/A")
+        }
+        selected_task_id = None
+        if task_option_map:
+            selected_task_label = st.selectbox("Task action lens", list(task_option_map.keys()), key="dispatch_task_lens")
+            selected_task_id = task_option_map[selected_task_label]
+        task_execution_rows = rows_from_result(api_get(f"/tasks/{selected_task_id}/executions")) if selected_task_id else []
+
+        assignment_left, assignment_right = st.columns([1.0, 1.0])
+        with assignment_left:
+            render_table("Task Executions", task_execution_rows, caption="Execution trail for the selected workflow task.", limit=20)
+        with assignment_right:
+            with st.form("dispatch_task_action_form"):
+                action = st.selectbox("Action", ["assigned", "approved", "deployed", "rerouted", "closed"], index=0)
+                new_status = st.selectbox("Resulting status", ["assigned", "approved", "in_progress", "deployed", "completed", "closed"], index=0)
+                assigned_unit = st.text_input("Assigned unit")
+                notes = st.text_area("Action notes", height=120)
+                if st.form_submit_button("Record task action", use_container_width=True, disabled=selected_task_id is None):
+                    payload = {
+                        "action": action,
+                        "status": new_status,
+                        "assigned_unit": assigned_unit or None,
+                        "notes": notes or None,
+                    }
+                    run_action_and_refresh(f"/tasks/{selected_task_id}/actions", payload=payload, success_message="Task action recorded.")
+
+    with tabs[2]:
+        closure_left, closure_right = st.columns([1.0, 1.0])
+        with closure_left:
+            render_table("Completed Tasks", completed_tasks, caption="Workflow tasks that reached closure or completion.", limit=18)
+        with closure_right:
+            if selected_case_id is not None:
+                timeline_rows = rows_from_result(api_get(f"/cases/{selected_case_id}/timeline"))
+                render_table(
+                    "Case Timeline Alignment",
+                    timeline_rows,
+                    caption="Case timeline entries aligned to the current case focus for closure review.",
+                    limit=18,
+                )
+            else:
+                render_inline_note("Select a case focus from the sidebar to align dispatch closure with a case timeline.")
+
+
 def render_intake_and_search(
     district_scope: str,
     selected_case_id: int | None,
@@ -3945,7 +4768,7 @@ def render_intake_and_search(
         ],
     )
 
-    tabs = st.tabs(["Create Case", "Complaint Intake", "Link Records", "Registry Search"])
+    tabs = st.tabs(["Create Case", "Complaint Intake", "Link Records", "Registry Search", "Unified Search and Fusion"])
     with tabs[0]:
         with st.form("create_case_form"):
             title = st.text_input("Case title")
@@ -4020,6 +4843,42 @@ def render_intake_and_search(
                     )
             else:
                 render_result_error(search_result, "Integrated Search")
+
+    with tabs[4]:
+        unified_query = st.text_input("Unified search query", key="unified_search_query")
+        if st.button("Run unified search fabric", key="unified_search_submit", use_container_width=True):
+            params = compact_params(
+                {
+                    "q": unified_query.strip(),
+                    "district": None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope,
+                    "case_id": selected_case_id,
+                }
+            )
+            search_result = api_get("/search/unified", params=params or None)
+            if search_result.get("ok") and isinstance(search_result.get("data"), dict):
+                payload = search_result["data"]
+                count_payload = payload.get("counts") or {}
+                render_metric_grid(
+                    [
+                        ("Complaints", count_payload.get("complaints", 0)),
+                        ("Cases", count_payload.get("cases", 0)),
+                        ("Entities", count_payload.get("entities", 0)),
+                        ("Watchlists", count_payload.get("watchlists", 0)),
+                        ("Tasks", count_payload.get("tasks", 0)),
+                        ("Messages", count_payload.get("messages", 0)),
+                        ("Checkpoints", count_payload.get("checkpoints", 0)),
+                        ("Geofences", count_payload.get("geofences", 0)),
+                        ("Cameras", count_payload.get("cameras", 0)),
+                    ]
+                )
+                render_table(
+                    "Top Fusion-Scored Hits",
+                    payload_to_rows(payload.get("top_hits")),
+                    caption="Unified search results scored by fusion weight, operational relevance, and local context.",
+                    limit=25,
+                )
+            else:
+                render_result_error(search_result, "Unified Search")
 
     left, right = st.columns(2)
     with left:
@@ -4119,10 +4978,12 @@ with st.sidebar:
             "Mission Control",
             "Geo Command",
             "Graph Fabric",
+            "Camera Command",
             "Fusion Center",
             "Case Dossier",
             "District Command",
             "War Room",
+            "Dispatch Engine",
             "Watchlists and Alerts",
             "Department Comms",
             "Tasking and Exports",
@@ -4142,6 +5003,8 @@ elif workspace == "Geo Command":
     render_geo_command(district_scope)
 elif workspace == "Graph Fabric":
     render_graph_fabric(district_scope, selected_case_id)
+elif workspace == "Camera Command":
+    render_camera_command(district_scope, selected_case_id)
 elif workspace == "Fusion Center":
     render_fusion_center(district_scope, selected_case_id)
 elif workspace == "Case Dossier":
@@ -4150,6 +5013,8 @@ elif workspace == "District Command":
     render_district_command(district_scope, me_payload, case_rows)
 elif workspace == "War Room":
     render_war_room(district_scope, selected_case_id, me_payload)
+elif workspace == "Dispatch Engine":
+    render_dispatch_engine(district_scope, selected_case_id, me_payload)
 elif workspace == "Watchlists and Alerts":
     render_watchlists_and_alerts(district_scope, selected_case_id)
 elif workspace == "Department Comms":

@@ -169,6 +169,11 @@ class VideoParticipantStateCreate(BaseModel):
     screen_sharing: bool | None = None
 
 
+class VideoSessionControlCreate(BaseModel):
+    status: str = "active"
+    notes: str | None = None
+
+
 class WorkflowPlaybookLaunchCreate(BaseModel):
     district: str
     assigned_unit: str | None = None

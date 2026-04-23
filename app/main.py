@@ -19,7 +19,7 @@ from app.schemas import (
     DepartmentMessageCreate, DepartmentMessageReadCreate, PresenceHeartbeatCreate, CheckpointPlanCreate,
     TypingHeartbeatCreate, GraphSavedViewCreate, GeofenceZoneCreate, CameraIncidentAssignmentCreate,
     TaskCreate, TaskActionCreate, EntityResolutionActionCreate, ConnectorRunCreate,
-    VideoSessionCreate, VideoParticipantStateCreate, WorkflowPlaybookLaunchCreate
+    VideoSessionCreate, VideoParticipantStateCreate, VideoSessionControlCreate, WorkflowPlaybookLaunchCreate
 )
 from db.database import get_db, SessionLocal
 from db.models import (
@@ -326,6 +326,101 @@ def serialize_playbook(row: WorkflowPlaybook) -> dict:
         "action_template": safe_json_list(row.action_template_json),
         "status": row.status,
         "created_at": row.created_at.isoformat(),
+    }
+
+
+def freshness_bucket(reference_time: datetime | None) -> str:
+    if reference_time is None:
+        return "unknown"
+    seconds_since = max(int((datetime.utcnow() - reference_time).total_seconds()), 0)
+    if seconds_since <= 600:
+        return "live"
+    if seconds_since <= 3600:
+        return "recent"
+    if seconds_since <= 21600:
+        return "aging"
+    return "stale"
+
+
+def connector_health_payload(
+    connector: ConnectorRegistry | None,
+    run_rows: list[ConnectorRun],
+    artifact_rows: list[ConnectorArtifact],
+    queue_rows: list[IngestQueue],
+) -> dict:
+    latest_run = run_rows[0] if run_rows else None
+    latest_reference = None
+    if latest_run:
+        latest_reference = latest_run.finished_at or latest_run.started_at
+    freshness = freshness_bucket(latest_reference)
+    avg_latency = round(sum(row.latency_ms or 0 for row in run_rows[:5]) / max(len(run_rows[:5]), 1), 1) if run_rows else 0.0
+    completed_runs = [row for row in run_rows if row.status == "completed"]
+    success_ratio = round(len(completed_runs) / max(len(run_rows), 1), 2) if run_rows else 0.0
+    backlog = len([row for row in queue_rows if str(row.status).lower() not in {"processed", "completed"}])
+    health_score = round(
+        (success_ratio * 55)
+        + (18 if freshness == "live" else 12 if freshness == "recent" else 5 if freshness == "aging" else 0)
+        + max(18 - min(avg_latency / 120, 18), 0)
+        + max(12 - min(backlog * 2.2, 12), 0),
+        2,
+    )
+    return {
+        "connector_name": None if connector is None else connector.connector_name,
+        "source_type": None if connector is None else connector.source_type,
+        "sanctioned": None if connector is None else connector.sanctioned,
+        "access_mode": None if connector is None else connector.access_mode,
+        "notes": None if connector is None else connector.notes,
+        "latest_status": None if latest_run is None else latest_run.status,
+        "latest_run_id": None if latest_run is None else latest_run.id,
+        "latest_started_at": None if latest_run is None or latest_run.started_at is None else latest_run.started_at.isoformat(),
+        "latest_finished_at": None if latest_run is None or latest_run.finished_at is None else latest_run.finished_at.isoformat(),
+        "freshness": freshness,
+        "run_count": len(run_rows),
+        "artifact_count": len(artifact_rows),
+        "queue_backlog": backlog,
+        "avg_latency_ms": avg_latency,
+        "success_ratio": success_ratio,
+        "health_score": health_score,
+    }
+
+
+def video_quality_payload(session_row: VideoSession, participant_rows: list[VideoParticipant]) -> dict:
+    current_time = datetime.utcnow()
+    online_rows = [
+        row for row in participant_rows
+        if row.last_seen_at and int((current_time - row.last_seen_at).total_seconds()) <= 150
+    ]
+    online_count = len(online_rows)
+    muted_count = sum(1 for row in online_rows if row.muted)
+    camera_count = sum(1 for row in online_rows if row.camera_enabled)
+    raised_hands = sum(1 for row in online_rows if row.hand_raised)
+    screen_shares = sum(1 for row in online_rows if row.screen_sharing)
+    stale_rows = [
+        row for row in participant_rows
+        if not row.last_seen_at or int((current_time - row.last_seen_at).total_seconds()) > 150
+    ]
+    readiness_score = round(
+        (online_count * 18)
+        + (camera_count * 10)
+        + (screen_shares * 8)
+        + max(18 - (len(stale_rows) * 6), 0)
+        + (10 if session_row.status == "active" else 4 if session_row.status == "standby" else 0),
+        2,
+    )
+    return {
+        "session_code": session_row.session_code,
+        "room_name": session_row.room_name,
+        "status": session_row.status,
+        "participant_count": len(participant_rows),
+        "online_count": online_count,
+        "muted_count": muted_count,
+        "camera_enabled_count": camera_count,
+        "raised_hands": raised_hands,
+        "screen_shares": screen_shares,
+        "stale_participants": len(stale_rows),
+        "freshness": freshness_bucket(session_row.started_at),
+        "command_readiness_score": readiness_score,
+        "recommended_action": "Hold live command brief" if readiness_score >= 55 else "Stabilize attendance and media posture",
     }
 
 
@@ -1613,6 +1708,54 @@ def create_graph_saved_view(
     return {"status": "created", "saved_view_id": row.id}
 
 
+@app.get('/ontology/summary')
+def ontology_summary(
+    district: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    entity_rows = db.query(Entity).filter(Entity.district == district).all() if district else db.query(Entity).all()
+    entity_ids = {row.id for row in entity_rows}
+    attribute_rows = db.query(EntityAttributeFact).filter(EntityAttributeFact.entity_id.in_(entity_ids)).all() if entity_ids else []
+    candidate_rows = db.query(EntityResolutionCandidate).all()
+    if district:
+        candidate_rows = [
+            row for row in candidate_rows
+            if row.left_entity_id in entity_ids or row.right_entity_id in entity_ids
+        ]
+    class_rows = db.query(OntologyClass).all()
+    relation_rows = db.query(OntologyRelationType).all()
+    provenance_count = db.query(ProvenanceRecord).filter(ProvenanceRecord.district == district).count() if district else db.query(ProvenanceRecord).count()
+    class_breakdown = defaultdict(lambda: {"entities": 0, "attribute_facts": 0})
+    for entity in entity_rows:
+        class_breakdown[entity.entity_type]["entities"] += 1
+    for fact in attribute_rows:
+        entity = next((row for row in entity_rows if row.id == fact.entity_id), None)
+        if entity:
+            class_breakdown[entity.entity_type]["attribute_facts"] += 1
+    return {
+        "district": district,
+        "summary": {
+            "ontology_classes": len(class_rows),
+            "relationship_types": len(relation_rows),
+            "entities_in_scope": len(entity_rows),
+            "attribute_facts": len(attribute_rows),
+            "resolution_candidates": len(candidate_rows),
+            "pending_candidates": sum(1 for row in candidate_rows if row.status == "pending"),
+            "accepted_candidates": sum(1 for row in candidate_rows if row.status == "accepted"),
+            "provenance_records": provenance_count,
+        },
+        "class_breakdown": [
+            {
+                "class_name": class_name,
+                "entity_count": payload["entities"],
+                "attribute_facts": payload["attribute_facts"],
+            }
+            for class_name, payload in sorted(class_breakdown.items())
+        ],
+    }
+
+
 @app.get('/ontology/classes')
 def ontology_classes(user: User = Depends(current_user), db: Session = Depends(get_db)):
     rows = db.query(OntologyClass).order_by(OntologyClass.category, OntologyClass.display_name).all()
@@ -1813,6 +1956,44 @@ def entity_resolution_candidates(
     return output
 
 
+@app.get('/entity-resolution/summary')
+def entity_resolution_summary(
+    district: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    entity_lookup = entity_lookup_map(db)
+    rows = db.query(EntityResolutionCandidate).all()
+    filtered_rows = []
+    for row in rows:
+        left_entity = entity_lookup.get(row.left_entity_id)
+        right_entity = entity_lookup.get(row.right_entity_id)
+        if district and district not in {getattr(left_entity, "district", None), getattr(right_entity, "district", None)}:
+            continue
+        filtered_rows.append(row)
+    status_counts = defaultdict(int)
+    cluster_breakdown = defaultdict(int)
+    for row in filtered_rows:
+        status_counts[row.status] += 1
+        cluster_breakdown[row.cluster_ref or "unclustered"] += 1
+    avg_match_score = round(sum(row.match_score or 0.0 for row in filtered_rows) / max(len(filtered_rows), 1), 3) if filtered_rows else 0.0
+    return {
+        "district": district,
+        "summary": {
+            "candidate_count": len(filtered_rows),
+            "avg_match_score": avg_match_score,
+            "pending": status_counts.get("pending", 0),
+            "accepted": status_counts.get("accepted", 0),
+            "review": status_counts.get("review", 0),
+            "rejected": status_counts.get("rejected", 0),
+        },
+        "clusters": [
+            {"cluster_ref": cluster_ref, "candidate_count": count}
+            for cluster_ref, count in sorted(cluster_breakdown.items(), key=lambda item: item[1], reverse=True)
+        ],
+    }
+
+
 @app.get('/entity-resolution/decisions')
 def entity_resolution_decisions(
     district: str | None = None,
@@ -1906,6 +2087,45 @@ def entity_resolution_resolve(
         "candidate_id": candidate.id,
         "decision_status": decision.decision_status,
         "decision_id": decision.id,
+    }
+
+
+@app.get('/provenance/summary')
+def provenance_summary(
+    district: str | None = None,
+    object_type: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(ProvenanceRecord)
+    if district:
+        q = q.filter(ProvenanceRecord.district == district)
+    if object_type:
+        q = q.filter(ProvenanceRecord.object_type == object_type)
+    rows = q.all()
+    object_counts = defaultdict(int)
+    source_counts = defaultdict(int)
+    avg_confidence = round(sum(row.confidence or 0.0 for row in rows) / max(len(rows), 1), 3) if rows else 0.0
+    for row in rows:
+        object_counts[row.object_type] += 1
+        source_counts[row.source_name] += 1
+    return {
+        "district": district,
+        "object_type": object_type,
+        "summary": {
+            "record_count": len(rows),
+            "avg_confidence": avg_confidence,
+            "distinct_sources": len(source_counts),
+            "distinct_object_types": len(object_counts),
+        },
+        "object_breakdown": [
+            {"object_type": item[0], "record_count": item[1]}
+            for item in sorted(object_counts.items(), key=lambda item: item[1], reverse=True)
+        ],
+        "source_breakdown": [
+            {"source_name": item[0], "record_count": item[1]}
+            for item in sorted(source_counts.items(), key=lambda item: item[1], reverse=True)[:12]
+        ],
     }
 
 
@@ -2082,6 +2302,40 @@ def trigger_connector_run(
     }
 
 
+@app.get('/connectors/health')
+def connector_health(
+    connector_name: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    registry_rows = {row.connector_name: row for row in db.query(ConnectorRegistry).all()}
+    run_groups = defaultdict(list)
+    for row in db.query(ConnectorRun).order_by(ConnectorRun.id.desc()).all():
+        run_groups[row.connector_name].append(row)
+    artifact_groups = defaultdict(list)
+    for row in db.query(ConnectorArtifact).order_by(ConnectorArtifact.id.desc()).all():
+        artifact_groups[row.connector_name].append(row)
+    queue_groups = defaultdict(list)
+    for row in db.query(IngestQueue).order_by(IngestQueue.id.desc()).all():
+        queue_groups[row.source_name].append(row)
+
+    connector_names = set(registry_rows.keys()) | set(run_groups.keys()) | set(artifact_groups.keys()) | set(queue_groups.keys())
+    if connector_name:
+        connector_names = {name for name in connector_names if name == connector_name}
+    output = []
+    for name in sorted(connector_names):
+        payload = connector_health_payload(
+            registry_rows.get(name),
+            run_groups.get(name, []),
+            artifact_groups.get(name, []),
+            queue_groups.get(name, []),
+        )
+        if not payload.get("connector_name"):
+            payload["connector_name"] = name
+        output.append(payload)
+    return sorted(output, key=lambda row: float(row.get("health_score") or 0.0), reverse=True)
+
+
 @app.get('/video/sessions')
 def list_video_sessions(
     district: str | None = None,
@@ -2190,6 +2444,21 @@ def create_video_session(
     }
 
 
+@app.get('/video/sessions/{session_code}/quality')
+def video_session_quality(
+    session_code: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    session_row = db.query(VideoSession).filter(VideoSession.session_code == session_code).first()
+    if not session_row:
+        raise HTTPException(status_code=404, detail='Video session not found')
+    participant_rows = db.query(VideoParticipant).filter(VideoParticipant.session_id == session_row.id).all()
+    quality = video_quality_payload(session_row, participant_rows)
+    quality["participants"] = [serialize_video_participant(row) for row in participant_rows]
+    return quality
+
+
 @app.get('/video/sessions/{session_code}/participants')
 def list_video_participants(
     session_code: str,
@@ -2250,6 +2519,45 @@ def update_video_participant_state(
     payload["session_code"] = session_code
     dispatch_realtime_payload(video_room_name(session_code), payload)
     return {"status": "ok", "participant": payload}
+
+
+@app.post('/video/sessions/{session_code}/control')
+def control_video_session(
+    session_code: str,
+    body: VideoSessionControlCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    session_row = db.query(VideoSession).filter(VideoSession.session_code == session_code).first()
+    if not session_row:
+        raise HTTPException(status_code=404, detail='Video session not found')
+    session_row.status = body.status
+    if body.status == "closed":
+        session_row.ended_at = datetime.utcnow()
+    elif session_row.started_at is None:
+        session_row.started_at = datetime.utcnow()
+    if body.notes:
+        session_row.notes = f"{(session_row.notes or '').strip()} | {body.notes}".strip(" |")
+    db.add(
+        NotificationEvent(
+            notification_type="video_control",
+            channel="in_app",
+            recipient=session_row.room_name,
+            subject=f"Video session {body.status}",
+            message=f"{user.username} set video session {session_code} to {body.status}.",
+            status="queued",
+            related_object_type="video_session",
+            related_object_id=str(session_row.id),
+        )
+    )
+    log_action(db, user.username, 'control_video_session', 'video_session', str(session_row.id))
+    db.commit()
+    payload = serialize_video_session(session_row, current_username=user.username)
+    payload["event_type"] = "session_control"
+    payload["control_status"] = body.status
+    payload["control_notes"] = body.notes
+    dispatch_realtime_payload(video_room_name(session_code), payload)
+    return {"status": "ok", "session": payload}
 
 
 @app.websocket('/video/sessions/{session_code}/ws')
@@ -2326,6 +2634,112 @@ def geo_corridors(
         }
         for row in rows
     ]
+
+
+@app.get('/geo/corridor-camera-coupling')
+def geo_corridor_camera_coupling(
+    district: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    corridor_rows = db.query(OperationalCorridor)
+    if district:
+        corridor_rows = corridor_rows.filter(OperationalCorridor.district == district)
+    corridor_rows = corridor_rows.order_by(OperationalCorridor.risk_score.desc()).all()
+    camera_rows = db.query(CameraAsset).all()
+    assignment_rows = db.query(CameraIncidentAssignment).all()
+    assignment_lookup = defaultdict(int)
+    for row in assignment_rows:
+        assignment_lookup[row.camera_asset_id] += 1
+
+    output = []
+    for corridor in corridor_rows:
+        point_districts = {str(point.get("district")) for point in safe_json_list(corridor.points_json) if point.get("district")}
+        scoped_cameras = [row for row in camera_rows if row.district in point_districts]
+        top_cameras = sorted(scoped_cameras, key=lambda row: (row.blind_spot_score or 0.0, row.health_score or 0.0), reverse=True)[:5]
+        avg_blind_score = round(sum(row.blind_spot_score or 0.0 for row in scoped_cameras) / max(len(scoped_cameras), 1), 2) if scoped_cameras else 0.0
+        avg_health = round(sum(row.health_score or 0.0 for row in scoped_cameras) / max(len(scoped_cameras), 1), 2) if scoped_cameras else 0.0
+        output.append(
+            {
+                "corridor_name": corridor.corridor_name,
+                "district": corridor.district,
+                "corridor_type": corridor.corridor_type,
+                "route_ref": corridor.route_ref,
+                "surveillance_priority": corridor.surveillance_priority,
+                "risk_score": corridor.risk_score,
+                "camera_count": len(scoped_cameras),
+                "avg_blind_spot_score": avg_blind_score,
+                "avg_health_score": avg_health,
+                "linked_assignments": sum(assignment_lookup.get(row.id, 0) for row in top_cameras),
+                "top_cameras": [row.camera_id for row in top_cameras],
+                "recommended_action": "Attach corridor cameras and checkpoint watch" if corridor.risk_score >= 0.8 else "Maintain corridor camera posture",
+            }
+        )
+    return output
+
+
+@app.get('/workflow/intelligence')
+def workflow_intelligence(
+    district: str | None = None,
+    case_id: int | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    task_rows = db.query(TaskQueue)
+    checkpoint_rows = db.query(CheckpointPlan)
+    playbook_rows = db.query(WorkflowPlaybook)
+    corridor_rows = db.query(OperationalCorridor)
+    if district:
+        task_rows = task_rows.filter(TaskQueue.district == district)
+        checkpoint_rows = checkpoint_rows.filter(CheckpointPlan.district == district)
+        playbook_rows = playbook_rows.filter(WorkflowPlaybook.district == district)
+        corridor_rows = corridor_rows.filter(OperationalCorridor.district == district)
+    if case_id:
+        task_rows = task_rows.filter(or_(TaskQueue.case_id == case_id, TaskQueue.case_id == None))
+        checkpoint_rows = checkpoint_rows.filter(or_(CheckpointPlan.case_id == case_id, CheckpointPlan.case_id == None))
+    task_rows = task_rows.all()
+    checkpoint_rows = checkpoint_rows.all()
+    playbook_rows = playbook_rows.all()
+    corridor_rows = corridor_rows.all()
+
+    district_breakdown = defaultdict(lambda: {"tasks": 0, "active_tasks": 0, "high_priority": 0, "checkpoints": 0, "playbooks": 0, "corridors": 0})
+    for row in task_rows:
+        district_key = row.district or "Statewide"
+        district_breakdown[district_key]["tasks"] += 1
+        district_breakdown[district_key]["active_tasks"] += 1 if row.status in {"approved", "in_progress", "deployed"} else 0
+        district_breakdown[district_key]["high_priority"] += 1 if row.priority in {"high", "critical"} else 0
+    for row in checkpoint_rows:
+        district_breakdown[row.district or "Statewide"]["checkpoints"] += 1
+    for row in playbook_rows:
+        district_breakdown[row.district or "Statewide"]["playbooks"] += 1
+    for row in corridor_rows:
+        district_breakdown[row.district or "Statewide"]["corridors"] += 1
+
+    return {
+        "district": district,
+        "case_id": case_id,
+        "summary": {
+            "task_count": len(task_rows),
+            "active_tasks": sum(1 for row in task_rows if row.status in {"approved", "in_progress", "deployed"}),
+            "high_priority_tasks": sum(1 for row in task_rows if row.priority in {"high", "critical"}),
+            "checkpoint_count": len(checkpoint_rows),
+            "active_checkpoints": sum(1 for row in checkpoint_rows if row.status in {"active", "deployed"}),
+            "playbook_count": len(playbook_rows),
+            "corridor_count": len(corridor_rows),
+        },
+        "district_breakdown": [
+            {
+                "district": district_key,
+                "tasks": payload["tasks"],
+                "active_tasks": payload["active_tasks"],
+                "high_priority_tasks": payload["high_priority"],
+                "checkpoints": payload["checkpoints"],
+                "playbooks": payload["playbooks"],
+                "corridors": payload["corridors"],
+            }
+            for district_key, payload in sorted(district_breakdown.items(), key=lambda item: item[0])
+        ],
+    }
 
 
 @app.get('/workflow/playbooks')

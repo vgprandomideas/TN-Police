@@ -1470,6 +1470,8 @@ def render_video_briefing_panel(
     meeting_room_code = active_session_code
     meeting_url_with_name = str(selected_session.get("join_url") or fallback_meeting_url)
     participant_rows = raw_rows_from_result(api_get(f"/video/sessions/{active_session_code}/participants")) if selected_session else []
+    quality_result = api_get(f"/video/sessions/{active_session_code}/quality") if selected_session else {"ok": False, "data": {}}
+    quality_payload = quality_result.get("data") if quality_result.get("ok") and isinstance(quality_result.get("data"), dict) else {}
 
     render_metric_grid(
         [
@@ -1478,6 +1480,7 @@ def render_video_briefing_panel(
             ("Eligible Personnel", len(online_personnel)),
             ("Raised Hands", sum(1 for row in participant_rows if row.get("hand_raised"))),
             ("Screen Shares", sum(1 for row in participant_rows if row.get("screen_sharing"))),
+            ("Command Readiness", (quality_payload.get("command_readiness_score", "N/A") if quality_payload else "N/A")),
             ("District Scope", district_scope),
         ]
     )
@@ -1538,6 +1541,33 @@ def render_video_briefing_panel(
         )
 
         if selected_session:
+            render_table(
+                "Session Quality",
+                [quality_payload] if quality_payload else [],
+                caption="Readiness and media-health indicators for the selected native video session.",
+                limit=1,
+            )
+            session_status = st.selectbox(
+                "Session status",
+                ["active", "standby", "closed"],
+                index=["active", "standby", "closed"].index(str(selected_session.get("status") or "active")) if str(selected_session.get("status") or "active") in {"active", "standby", "closed"} else 0,
+                key=f"video_status_{active_session_code}",
+            )
+            session_control_notes = st.text_area(
+                "Session control notes",
+                height=80,
+                key=f"video_control_notes_{active_session_code}",
+                placeholder="Shift room to standby, close briefing, or note conference posture.",
+            )
+            if st.button("Apply session control", use_container_width=True, key=f"video_control_{active_session_code}"):
+                run_action_and_refresh(
+                    f"/video/sessions/{active_session_code}/control",
+                    payload={
+                        "status": session_status,
+                        "notes": session_control_notes or None,
+                    },
+                    success_message="Video session control applied.",
+                )
             device_label = st.text_input("Device label", value="Browser console", key=f"video_device_{active_session_code}")
             join_state = st.selectbox("Join state", ["connected", "monitoring", "reconnecting", "observer"], index=0, key=f"video_join_state_{active_session_code}")
             hand_raised = st.checkbox("Hand raised", value=False, key=f"video_hand_raised_{active_session_code}")
@@ -2926,6 +2956,9 @@ def render_geo_command(district_scope: str) -> None:
     corridor_rows = raw_rows_from_result(
         api_get("/geo/corridors", params=compact_params({"district": detail_district}) or None)
     ) or statewide_corridor_rows
+    corridor_camera_rows = rows_from_result(
+        api_get("/geo/corridor-camera-coupling", params=compact_params({"district": detail_district}) or None)
+    ) or rows_from_result(api_get("/geo/corridor-camera-coupling"))
     route_option_map = {f"{row.get('subject_label')} | {row.get('route_type')}": str(row.get("route_id")) for row in route_rows}
     query_route = get_query_param("ops_route")
     if query_route and route_rows and st.session_state.get("geo_route_id") != query_route:
@@ -3115,6 +3148,12 @@ def render_geo_command(district_scope: str) -> None:
                 corridor_rows,
                 caption="Visible corridor layers with route reference, risk score, and surveillance priority.",
                 limit=18,
+            )
+            render_table(
+                "Corridor-Camera Coupling",
+                corridor_camera_rows,
+                caption="Recommended camera posture and assignment density against each operational corridor.",
+                limit=14,
             )
             render_table(
                 "Checkpoint Coupling",
@@ -3510,6 +3549,9 @@ def render_graph_fabric(district_scope: str, selected_case_id: int | None) -> No
         selected_entity_id = to_optional_int(str(selected_node_id).split("-", 1)[1])
     profile_result = api_get(f"/ontology/entities/{selected_entity_id}/profile") if selected_entity_id is not None else {"ok": False, "data": {}}
     profile_payload = profile_result.get("data") if profile_result.get("ok") and isinstance(profile_result.get("data"), dict) else {}
+    ontology_summary = api_get("/ontology/summary", params=compact_params({"district": district_param}) or None).get("data")
+    resolution_summary = api_get("/entity-resolution/summary", params=compact_params({"district": district_param}) or None).get("data")
+    provenance_summary = api_get("/provenance/summary", params=compact_params({"district": district_param}) or None).get("data")
     ontology_class_rows = rows_from_result(api_get("/ontology/classes"))
     relationship_rows = rows_from_result(api_get("/ontology/relationship-types"))
     resolution_rows = rows_from_result(api_get("/entity-resolution/candidates", params=compact_params({"district": district_param, "entity_id": selected_entity_id}) or None))
@@ -3723,6 +3765,25 @@ def render_graph_fabric(district_scope: str, selected_case_id: int | None) -> No
                     render_result_error(compare_result, "Graph Compare")
 
     with tabs[3]:
+        ontology_summary_payload = ontology_summary if isinstance(ontology_summary, dict) else {}
+        resolution_summary_payload = resolution_summary if isinstance(resolution_summary, dict) else {}
+        provenance_summary_payload = provenance_summary if isinstance(provenance_summary, dict) else {}
+        ontology_counts = ontology_summary_payload.get("summary") or {}
+        resolution_counts = resolution_summary_payload.get("summary") or {}
+        provenance_counts = provenance_summary_payload.get("summary") or {}
+        render_metric_grid(
+            [
+                ("Ontology Classes", ontology_counts.get("ontology_classes", 0)),
+                ("Relation Types", ontology_counts.get("relationship_types", 0)),
+                ("Entities in Scope", ontology_counts.get("entities_in_scope", 0)),
+                ("Attribute Facts", ontology_counts.get("attribute_facts", 0)),
+                ("Resolution Pending", resolution_counts.get("pending", 0)),
+                ("Resolution Accepted", resolution_counts.get("accepted", 0)),
+                ("Avg Match Score", resolution_counts.get("avg_match_score", 0)),
+                ("Provenance Records", provenance_counts.get("record_count", 0)),
+                ("Distinct Sources", provenance_counts.get("distinct_sources", 0)),
+            ]
+        )
         ontology_left, ontology_right = st.columns([1.05, 0.95])
         with ontology_left:
             render_table(
@@ -3743,6 +3804,12 @@ def render_graph_fabric(district_scope: str, selected_case_id: int | None) -> No
                 caption="Observed attribute facts for the focused entity node.",
                 limit=18,
             )
+            render_table(
+                "Class Breakdown",
+                payload_to_rows(ontology_summary_payload.get("class_breakdown")),
+                caption="Coverage of ontology classes by entities and captured attribute facts.",
+                limit=12,
+            )
         with ontology_right:
             render_table(
                 "Entity Profile",
@@ -3762,6 +3829,12 @@ def render_graph_fabric(district_scope: str, selected_case_id: int | None) -> No
                 caption="Source lineage and operational provenance for the selected entity or case lens.",
                 limit=14,
             )
+            render_table(
+                "Source Breakdown",
+                payload_to_rows(provenance_summary_payload.get("source_breakdown")),
+                caption="Provenance density by source system or evidence lane.",
+                limit=12,
+            )
 
         resolution_left, resolution_right = st.columns([1.04, 0.96])
         with resolution_left:
@@ -3775,6 +3848,12 @@ def render_graph_fabric(district_scope: str, selected_case_id: int | None) -> No
                 "Resolution Decisions",
                 payload_to_rows(profile_payload.get("resolution_decisions")) or decision_rows,
                 caption="Analyst decisions previously recorded against candidate merges or reviews.",
+                limit=12,
+            )
+            render_table(
+                "Resolution Clusters",
+                payload_to_rows(resolution_summary_payload.get("clusters")),
+                caption="Duplicate-resolution cluster density across the active graph scope.",
                 limit=12,
             )
         with resolution_right:
@@ -5170,6 +5249,7 @@ def render_camera_command(district_scope: str, selected_case_id: int | None) -> 
 def render_connector_ops(district_scope: str, selected_case_id: int | None) -> None:
     district_param = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
     connector_rows = rows_from_result(api_get("/connectors"))
+    connector_health_rows = rows_from_result(api_get("/connectors/health"))
     adapter_rows = rows_from_result(api_get("/adapter-stubs"))
     run_rows = rows_from_result(api_get("/connectors/runs"))
     artifact_rows = rows_from_result(
@@ -5191,11 +5271,13 @@ def render_connector_ops(district_scope: str, selected_case_id: int | None) -> N
             f"Case focus: {selected_case_id if selected_case_id is not None else 'none'}",
             f"Connectors: {len(connector_rows)}",
             f"Artifacts: {len(artifact_rows)}",
+            f"Health rows: {len(connector_health_rows)}",
         ],
     )
     render_metric_grid(
         [
             ("Sanctioned Connectors", len(connector_rows)),
+            ("Health Snapshots", len(connector_health_rows)),
             ("Adapter Stubs", len(adapter_rows)),
             ("Connector Runs", len(run_rows)),
             ("Running Runs", len(running_rows)),
@@ -5205,7 +5287,7 @@ def render_connector_ops(district_scope: str, selected_case_id: int | None) -> N
         ]
     )
 
-    tabs = st.tabs(["Registry", "Run History", "Artifact Ledger", "Trigger Connector"])
+    tabs = st.tabs(["Registry", "Health and Freshness", "Run History", "Artifact Ledger", "Trigger Connector"])
     with tabs[0]:
         registry_left, registry_right = st.columns([1.02, 0.98])
         with registry_left:
@@ -5230,6 +5312,26 @@ def render_connector_ops(district_scope: str, selected_case_id: int | None) -> N
             )
 
     with tabs[1]:
+        health_left, health_right = st.columns([1.0, 1.0])
+        with health_left:
+            render_table(
+                "Connector Health",
+                connector_health_rows,
+                caption="Connector readiness scored across freshness, latency, backlog, and success ratio.",
+                limit=16,
+            )
+        with health_right:
+            freshness_buckets = defaultdict(int)
+            for row in connector_health_rows:
+                freshness_buckets[str(row.get("freshness") or "unknown")] += 1
+            render_table(
+                "Freshness Breakdown",
+                [{"freshness": key, "connector_count": value} for key, value in freshness_buckets.items()],
+                caption="How current each sanctioned connector is relative to its latest run or signal.",
+                limit=8,
+            )
+
+    with tabs[2]:
         run_left, run_right = st.columns([1.0, 1.0])
         with run_left:
             render_table(
@@ -5252,7 +5354,7 @@ def render_connector_ops(district_scope: str, selected_case_id: int | None) -> N
                 limit=10,
             )
 
-    with tabs[2]:
+    with tabs[3]:
         artifact_left, artifact_right = st.columns([1.06, 0.94])
         with artifact_left:
             render_table(
@@ -5274,7 +5376,7 @@ def render_connector_ops(district_scope: str, selected_case_id: int | None) -> N
                 limit=18,
             )
 
-    with tabs[3]:
+    with tabs[4]:
         connector_option_map = {
             str(row.get("connector_name")): row
             for row in connector_rows
@@ -5301,6 +5403,7 @@ def render_dispatch_engine(district_scope: str, selected_case_id: int | None, me
     task_rows = rows_from_result(api_get("/tasks", params=compact_params({"district": district_param, "case_id": selected_case_id}) or None))
     checkpoint_rows = rows_from_result(api_get("/checkpoint-plans", params=compact_params({"district": district_param, "case_id": selected_case_id}) or None))
     playbook_rows = rows_from_result(api_get("/workflow/playbooks", params=compact_params({"district": district_param}) or None))
+    workflow_intelligence = api_get("/workflow/intelligence", params=compact_params({"district": district_param, "case_id": selected_case_id}) or None).get("data")
     case_rows = rows_from_result(api_get("/cases"))
     district_rows = build_district_map_rows(rows_from_result(api_get("/geo/district-heatmap")))
     cluster_rows = rows_from_result(api_get("/fusion/clusters"))
@@ -5311,6 +5414,8 @@ def render_dispatch_engine(district_scope: str, selected_case_id: int | None, me
     approved_tasks = [row for row in task_rows if str(row.get("status")).lower() == "approved"]
     active_tasks = [row for row in task_rows if str(row.get("status")).lower() in {"in_progress", "deployed"}]
     completed_tasks = [row for row in task_rows if str(row.get("status")).lower() in {"completed", "closed"}]
+    workflow_summary = workflow_intelligence.get("summary") if isinstance(workflow_intelligence, dict) else {}
+    workflow_breakdown = payload_to_rows((workflow_intelligence or {}).get("district_breakdown") if isinstance(workflow_intelligence, dict) else [])
 
     render_hero(
         "Dispatch Engine",
@@ -5332,11 +5437,18 @@ def render_dispatch_engine(district_scope: str, selected_case_id: int | None, me
             ("Completed", len(completed_tasks)),
             ("Checkpoint Actions", len(checkpoint_rows)),
             ("Workflow Playbooks", len(playbook_rows)),
+            ("Workflow Corridors", workflow_summary.get("corridor_count", 0)),
         ]
     )
 
     tabs = st.tabs(["Workflow Board", "Playbooks", "Assignments and Approvals", "Closure Timeline"])
     with tabs[0]:
+        render_table(
+            "Workflow Intelligence",
+            [workflow_summary] if workflow_summary else [],
+            caption="Operational workflow health across tasks, checkpoints, playbooks, and corridor coupling.",
+            limit=1,
+        )
         board_left, board_right = st.columns([1.0, 1.0])
         with board_left:
             render_table("Queued Tasks", queued_tasks, caption="Tasks awaiting assignment, approval, or dispatch action.", limit=16)
@@ -5344,6 +5456,7 @@ def render_dispatch_engine(district_scope: str, selected_case_id: int | None, me
         with board_right:
             render_table("Approved Tasks", approved_tasks, caption="Tasks cleared for field execution.", limit=16)
             render_table("Checkpoint Workflow", checkpoint_rows, caption="Checkpoint actions participating in the current workflow lens.", limit=16)
+            render_table("District Breakdown", workflow_breakdown, caption="District-level distribution of task, checkpoint, playbook, and corridor pressure.", limit=12)
 
         route_option_map = {f"{row.get('subject_label')} | {row.get('route_type')}": row for row in route_rows}
         with st.expander("Create workflow task", expanded=False):

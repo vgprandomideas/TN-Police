@@ -10,7 +10,7 @@ import time
 from html import escape
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import requests
 import streamlit as st
@@ -439,6 +439,19 @@ def to_optional_int(value: str) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def clamp_session_int(key: str, lower: int, upper: int, fallback: int) -> int:
+    if upper < lower:
+        return fallback
+    raw_value = st.session_state.get(key, fallback)
+    try:
+        numeric_value = int(raw_value)
+    except (TypeError, ValueError):
+        numeric_value = fallback
+    numeric_value = max(lower, min(upper, numeric_value))
+    st.session_state[key] = numeric_value
+    return numeric_value
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -1187,6 +1200,78 @@ def render_war_room_socket_panel(room_name: str, district_scope: str) -> None:
         height=320,
         scrolling=False,
     )
+
+
+def sanitize_room_slug(value: str) -> str:
+    slug = "".join(character.lower() if character.isalnum() else "-" for character in str(value or ""))
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug.strip("-") or "state-command-net"
+
+
+def render_video_briefing_panel(
+    room_name: str,
+    district_scope: str,
+    selected_case_id: int | None,
+    me_payload: dict[str, Any],
+    presence_rows: list[dict[str, Any]],
+) -> None:
+    district_slug = sanitize_room_slug("statewide" if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope)
+    room_slug = sanitize_room_slug(room_name)
+    case_slug = f"case-{selected_case_id}" if selected_case_id is not None else "general-ops"
+    meeting_room_code = f"tn-police-{district_slug}-{room_slug}-{case_slug}"
+    meeting_url = f"https://meet.jit.si/{meeting_room_code}"
+    meeting_url_with_name = (
+        meeting_url
+        + f"#userInfo.displayName=\"{quote(str(me_payload.get('username') or st.session_state.get('username') or 'Analyst'))}\""
+        + "&config.prejoinPageEnabled=false"
+    )
+    online_personnel = [
+        row for row in presence_rows
+        if str(row.get("is_online")).lower() == "yes"
+    ]
+    render_metric_grid(
+        [
+            ("Meeting Room", meeting_room_code),
+            ("Eligible Personnel", len(online_personnel)),
+            ("District Scope", district_scope),
+        ]
+    )
+    bridge_left, bridge_right = st.columns([1.2, 0.8])
+    with bridge_left:
+        components.html(
+            f"""
+            <div style="border:1px solid rgba(92,116,151,0.35);border-radius:24px;overflow:hidden;background:linear-gradient(180deg, rgba(15,25,40,0.98), rgba(10,18,28,0.96));">
+                <div style="padding:1rem 1rem 0.8rem 1rem;display:flex;justify-content:space-between;align-items:flex-end;gap:1rem;flex-wrap:wrap;">
+                    <div>
+                        <div style="color:#76b7ff;font-size:0.82rem;letter-spacing:0.12em;text-transform:uppercase;font-weight:700;">Video Briefing Bridge</div>
+                        <div style="color:#97a8c4;font-size:0.95rem;margin-top:0.25rem;">Secure live briefing room aligned to the active war-room thread.</div>
+                    </div>
+                    <div style="color:#97a8c4;font-size:0.82rem;">Camera, microphone, fullscreen, and screen sharing enabled.</div>
+                </div>
+                <iframe
+                    src="{escape(meeting_url_with_name, quote=True)}"
+                    allow="camera; microphone; fullscreen; display-capture"
+                    style="width:100%;height:720px;border:0;background:#081019;"
+                    referrerpolicy="no-referrer"
+                ></iframe>
+            </div>
+            """,
+            height=820,
+            scrolling=False,
+        )
+    with bridge_right:
+        st.link_button("Open Video Conference in New Tab", meeting_url_with_name, use_container_width=True)
+        st.code(meeting_room_code)
+        render_inline_note(
+            "Use the same room code across the department to join the live briefing bridge for this war-room thread. The embedded panel supports camera, microphone, and screen sharing."
+        )
+        render_table(
+            "Suggested Participants",
+            online_personnel,
+            caption="Currently online personnel who can join this briefing immediately.",
+            limit=16,
+        )
 
 
 def activate_live_refresh(enabled: bool, interval_seconds: int = 20, component_key: str = "live_refresh") -> None:
@@ -2970,7 +3055,8 @@ def render_geo_command(district_scope: str) -> None:
         )
         if playback_rows:
             playback_max = len(playback_rows)
-            playback_step = st.slider("Playback step", 1, playback_max, playback_max, key="geo_playback_step")
+            playback_default = clamp_session_int("geo_playback_step", 1, playback_max, playback_max)
+            playback_step = st.slider("Playback step", 1, playback_max, playback_default, key="geo_playback_step")
             visible_playback_rows = playback_rows[:playback_step]
             current_playback_row = visible_playback_rows[-1]
             playback_left, playback_right = st.columns([1.12, 0.88])
@@ -3384,7 +3470,7 @@ def render_war_room(
         ]
     )
 
-    tabs = st.tabs(["Operations", "Live Chat", "Realtime Signals", "Action Planner"])
+    tabs = st.tabs(["Operations", "Live Chat", "Video Briefing", "Realtime Signals", "Action Planner"])
     with tabs[0]:
         ops_left, ops_right = st.columns([1.08, 0.92])
         with ops_left:
@@ -3471,6 +3557,9 @@ def render_war_room(
                 run_action_and_refresh("/internal-comms/messages", payload=payload, success_message="War-room message posted.")
 
     with tabs[2]:
+        render_video_briefing_panel(selected_room, district_scope, selected_case_id, me_payload, presence_rows)
+
+    with tabs[3]:
         signal_left, signal_right = st.columns([1.0, 1.0])
         with signal_left:
             render_table(
@@ -3496,7 +3585,7 @@ def render_war_room(
                 "Socket monitor provides live event awareness in the selected room. Streamlit still refreshes the wider workspace on the configured live-update cadence so the rest of the board stays synchronized."
             )
 
-    with tabs[3]:
+    with tabs[4]:
         planner_left, planner_right = st.columns([1.08, 0.92])
         with planner_left:
             render_geo_html(

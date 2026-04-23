@@ -138,3 +138,39 @@ class TaskActionCreate(BaseModel):
     notes: str | None = None
     assigned_unit: str | None = None
     status: str | None = None
+
+
+class EntityResolutionActionCreate(BaseModel):
+    candidate_id: int
+    decision_status: str = "accepted"
+    notes: str | None = None
+
+
+class ConnectorRunCreate(BaseModel):
+    connector_name: str
+    run_mode: str = "poll"
+    notes: str | None = None
+
+
+class VideoSessionCreate(BaseModel):
+    room_name: str
+    district: str | None = None
+    case_id: int | None = None
+    session_mode: str = "webrtc_mesh"
+    notes: str | None = None
+
+
+class VideoParticipantStateCreate(BaseModel):
+    device_label: str | None = None
+    join_state: str | None = None
+    hand_raised: bool | None = None
+    muted: bool | None = None
+    camera_enabled: bool | None = None
+    screen_sharing: bool | None = None
+
+
+class WorkflowPlaybookLaunchCreate(BaseModel):
+    district: str
+    assigned_unit: str | None = None
+    case_id: int | None = None
+    notes: str | None = None

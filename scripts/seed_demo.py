@@ -2,11 +2,11 @@ import sys
 from pathlib import Path
 from datetime import datetime
 import csv
+import json
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from db.database import SessionLocal
 from db.database import SessionLocal
 from db.models import (
     PublicMetric, Entity, EntityLink, Incident, Station, IngestQueue, Case, CaseComment,
@@ -16,7 +16,9 @@ from db.models import (
     NotificationEvent, GraphSnapshot, GeoFenceAlert, AdapterStub, TaskQueue, TaskExecution,
     SuspectDossier, GraphInsight, CourtPacketExport, EvidenceIntegrityLog, NarrativeBrief,
     HotspotForecast, PatrolCoverageMetric, SimilarityHit, TimelineDigest, ExportJob,
-    WarRoomSnapshot, ExplorationBookmark
+    WarRoomSnapshot, ExplorationBookmark, OntologyClass, OntologyRelationType, EntityAttributeFact,
+    EntityResolutionCandidate, EntityResolutionDecision, ProvenanceRecord, ConnectorRun, ConnectorArtifact,
+    VideoParticipant, VideoSession, OperationalCorridor, WorkflowPlaybook
 )
 from services.graph_scoring import recompute_entity_scores
 from services.anomaly import score_incident_anomalies
@@ -43,6 +45,7 @@ def main():
         ("suspect", "Ravi Kumar", "Chennai"), ("device", "IMEI-8899-XX", "Chennai"), ("vehicle", "TN01AB1234", "Chennai"),
         ("account", "Acct-Ref-77", "Madurai"), ("suspect", "Sathish", "Madurai"), ("device", "IMEI-4455-ZZ", "Madurai"),
         ("wallet", "UPI-WALLET-443", "Coimbatore"), ("phone", "+91-9XXXXXX123", "Chennai"),
+        ("suspect", "R. Kumar", "Chennai"), ("device", "IMEI-8899-XX-ALT", "Chennai"), ("account", "Acct-Ref-77 ALT", "Madurai"),
     ]
     for etype, name, district in entities:
         if not db.query(Entity).filter_by(display_name=name).first():
@@ -55,7 +58,10 @@ def main():
              (entity_map["Ravi Kumar"],entity_map["TN01AB1234"],"travels_in",2.5),
              (entity_map["IMEI-8899-XX"],entity_map["Acct-Ref-77"],"linked_transfer",1.5),
              (entity_map["Sathish"],entity_map["IMEI-4455-ZZ"],"uses",2.0),
-             (entity_map["IMEI-8899-XX"],entity_map["+91-9XXXXXX123"],"registered_to",1.2)]
+             (entity_map["IMEI-8899-XX"],entity_map["+91-9XXXXXX123"],"registered_to",1.2),
+             (entity_map["R. Kumar"],entity_map["IMEI-8899-XX-ALT"],"uses",2.7),
+             (entity_map["IMEI-8899-XX-ALT"],entity_map["+91-9XXXXXX123"],"registered_to",1.1),
+             (entity_map["IMEI-8899-XX-ALT"],entity_map["Acct-Ref-77 ALT"],"linked_transfer",1.3)]
     for src, tgt, rel, weight in links:
         if not db.query(EntityLink).filter_by(source_entity_id=src, target_entity_id=tgt, relationship_type=rel).first():
             db.add(EntityLink(source_entity_id=src, target_entity_id=tgt, relationship_type=rel, weight=weight))
@@ -338,6 +344,176 @@ def main():
             ExplorationBookmark(username='admin_tn', bookmark_type='case', object_ref='case:1', title='Wallet scam master case', notes='Primary demo case for cyber workflow.'),
             ExplorationBookmark(username='cyber_analyst', bookmark_type='graph', object_ref='graph:case:1', title='Dense fraud graph', notes='Useful for briefing and demo walkthrough.'),
         ])
+    db.commit()
+
+    # v21+ ontology, provenance, resolution, connectors, and native video scaffolding
+    if not db.query(EntityAttributeFact).count():
+        attribute_facts = [
+            (entity_map["Ravi Kumar"], "full_name", "Ravi Kumar", "string", 0.97, "tn_cctns_citizen_portal", "CMP-REF-001"),
+            (entity_map["Ravi Kumar"], "phone", "+91-9XXXXXX123", "phone", 0.91, "national_cybercrime_portal", "NCCRP-RK-22"),
+            (entity_map["R. Kumar"], "alias_name", "R. Kumar", "string", 0.84, "field_interview_card", "FIC-CHE-14"),
+            (entity_map["IMEI-8899-XX"], "imei", "IMEI-8899-XX", "imei", 0.99, "device_seizure_memo", "SEIZ-CHE-09"),
+            (entity_map["IMEI-8899-XX-ALT"], "imei", "IMEI-8899-XX", "imei", 0.86, "cdr_device_correlation", "CDR-ALT-12"),
+            (entity_map["Acct-Ref-77"], "account_no", "Acct-Ref-77", "account", 0.88, "bank_freeze_note", "BNK-FRZ-77"),
+            (entity_map["Acct-Ref-77 ALT"], "account_alias", "Acct-Ref-77", "account", 0.74, "beneficiary_review", "BEN-REV-77A"),
+            (entity_map["TN01AB1234"], "registration_no", "TN01AB1234", "vehicle", 0.96, "vehicle_registry_bridge", "VREG-CHE-01"),
+            (entity_map["UPI-WALLET-443"], "wallet_id", "UPI-WALLET-443", "wallet", 0.93, "wallet_risk_feed", "WALLET-443"),
+        ]
+        for entity_id, attribute_name, attribute_value, value_type, confidence, source_name, source_ref in attribute_facts:
+            exists = db.query(EntityAttributeFact).filter_by(entity_id=entity_id, attribute_name=attribute_name, attribute_value=attribute_value).first()
+            if not exists:
+                db.add(
+                    EntityAttributeFact(
+                        entity_id=entity_id,
+                        attribute_name=attribute_name,
+                        attribute_value=attribute_value,
+                        value_type=value_type,
+                        confidence=confidence,
+                        source_name=source_name,
+                        source_ref=source_ref,
+                    )
+                )
+    db.commit()
+
+    if not db.query(EntityResolutionCandidate).count():
+        resolution_candidates = [
+            (entity_map["Ravi Kumar"], entity_map["R. Kumar"], 0.94, "Alias, phone overlap, and complaint-text similarity indicate the same suspect identity.", "accepted", "cluster-person-rk"),
+            (entity_map["IMEI-8899-XX"], entity_map["IMEI-8899-XX-ALT"], 0.89, "IMEI normalization and phone registration overlap indicate a duplicate device identity.", "accepted", "cluster-device-imei-8899"),
+            (entity_map["Acct-Ref-77"], entity_map["Acct-Ref-77 ALT"], 0.76, "Bank-freeze note and beneficiary review suggest an account alias needing analyst confirmation.", "review", "cluster-account-77"),
+        ]
+        for left_entity_id, right_entity_id, match_score, rationale, status, cluster_ref in resolution_candidates:
+            candidate = db.query(EntityResolutionCandidate).filter_by(left_entity_id=left_entity_id, right_entity_id=right_entity_id).first()
+            if not candidate:
+                db.add(
+                    EntityResolutionCandidate(
+                        left_entity_id=left_entity_id,
+                        right_entity_id=right_entity_id,
+                        match_score=match_score,
+                        rationale=rationale,
+                        status=status,
+                        cluster_ref=cluster_ref,
+                    )
+                )
+    db.commit()
+
+    if not db.query(EntityResolutionDecision).count():
+        candidate_lookup = {
+            (row.left_entity_id, row.right_entity_id): row
+            for row in db.query(EntityResolutionCandidate).all()
+        }
+        seeded_decisions = [
+            (candidate_lookup.get((entity_map["Ravi Kumar"], entity_map["R. Kumar"])), "accepted", "admin_tn", "Alias consolidated into the same investigation cluster."),
+            (candidate_lookup.get((entity_map["IMEI-8899-XX"], entity_map["IMEI-8899-XX-ALT"])), "accepted", "cyber_analyst", "Normalized duplicate IMEI variant to a shared device cluster."),
+        ]
+        for candidate, decision_status, decided_by, notes in seeded_decisions:
+            if not candidate:
+                continue
+            exists = db.query(EntityResolutionDecision).filter_by(candidate_id=candidate.id).first()
+            if not exists:
+                db.add(
+                    EntityResolutionDecision(
+                        candidate_id=candidate.id,
+                        decision_status=decision_status,
+                        decided_by=decided_by,
+                        notes=notes,
+                    )
+                )
+    db.commit()
+
+    if not db.query(ProvenanceRecord).count():
+        provenance_records = [
+            ("case", str(cases["Chennai wallet scam cluster"].id), "Chennai", "tn_cctns_citizen_portal", "complaint_feed", "CMP-REF-001", "case_created", 0.94, "admin_tn", "Primary complaint created the fraud investigation lens."),
+            ("entity", str(entity_map["Ravi Kumar"]), "Chennai", "national_cybercrime_portal", "entity_extraction", "NCCRP-RK-22", "entity_linked", 0.91, "cyber_analyst", "Suspect extracted from cross-portal complaint review."),
+            ("entity", str(entity_map["IMEI-8899-XX"]), "Chennai", "device_seizure_memo", "forensic_extract", "SEIZ-CHE-09", "observed", 0.98, "cyber_analyst", "IMEI captured during forensic intake."),
+            ("incident", str(incident_map.get("Citizen portal complaint references Ravi Kumar and same wallet handle")), "Chennai", "public_portal_bridge", "citizen_complaint", "CMP-REF-001", "incident_ingested", 0.87, "system", "Incident created from citizen complaint bridge."),
+            ("connector_artifact", "CMP-REF-001", "Chennai", "tn_cctns_citizen_portal", "connector_run", "artifact:CMP-REF-001", "artifact_synced", 0.92, "system", "Artifact synchronized from sanctioned complaint connector."),
+            ("resolution_candidate", "cluster-person-rk", "Chennai", "entity_resolution_engine", "fusion_score", "cluster-person-rk", "candidate_scored", 0.94, "system", "Alias-confidence threshold exceeded for suspect cluster."),
+        ]
+        for object_type, object_id, district, source_name, source_type, source_ref, operation, confidence, collected_by, notes in provenance_records:
+            exists = db.query(ProvenanceRecord).filter_by(object_type=object_type, object_id=object_id, source_name=source_name, source_ref=source_ref).first()
+            if not exists:
+                db.add(
+                    ProvenanceRecord(
+                        object_type=object_type,
+                        object_id=object_id,
+                        district=district,
+                        source_name=source_name,
+                        source_type=source_type,
+                        source_ref=source_ref,
+                        operation=operation,
+                        confidence=confidence,
+                        collected_by=collected_by,
+                        notes=notes,
+                    )
+                )
+    db.commit()
+
+    connector_runs = {row.connector_name: row for row in db.query(ConnectorRun).order_by(ConnectorRun.id.desc()).all()}
+    if connector_runs:
+        connector_artifact_specs = [
+            ("tn_cctns_citizen_portal", "complaint", "CMP-REF-001", "Chennai", cases["Chennai wallet scam cluster"].id, entity_map["Ravi Kumar"], "Wallet fraud complaint synchronized into the case fabric."),
+            ("national_cybercrime_portal", "entity", "NCCRP-RK-22", "Chennai", cases["Chennai wallet scam cluster"].id, entity_map["Ravi Kumar"], "Cybercrime portal alias artifact linked to suspect cluster."),
+            ("patrol_reporting_ingest", "patrol_update", "PATROL-NIGHT-22", "Madurai", cases["Madurai retaliation watch"].id, entity_map["Sathish"], "Night patrol update linked to retaliation watch posture."),
+        ]
+        for connector_name, record_type, external_ref, district, case_id, entity_id, ingest_summary in connector_artifact_specs:
+            run = connector_runs.get(connector_name)
+            if not run:
+                continue
+            exists = db.query(ConnectorArtifact).filter_by(connector_run_id=run.id, external_ref=external_ref).first()
+            if not exists:
+                db.add(
+                    ConnectorArtifact(
+                        connector_run_id=run.id,
+                        connector_name=connector_name,
+                        record_type=record_type,
+                        external_ref=external_ref,
+                        district=district,
+                        case_id=case_id,
+                        entity_id=entity_id,
+                        ingest_summary=ingest_summary,
+                        status="ingested",
+                    )
+                )
+    db.commit()
+
+    session = db.query(VideoSession).filter(VideoSession.session_code == "tn-police-state-command-ops").first()
+    if session and not db.query(VideoParticipant).filter(VideoParticipant.session_id == session.id).count():
+        video_participants = [
+            ("admin_tn", "admin", "Command bridge workstation", "connected", False, False, True, True),
+            ("cyber_analyst", "cyber_analyst", "Fusion desk node", "connected", False, True, True, False),
+            ("district_sp", "district_sp", "District command tablet", "connected", True, False, False, False),
+        ]
+        for username, role_label, device_label, join_state, hand_raised, muted, camera_enabled, screen_sharing in video_participants:
+            db.add(
+                VideoParticipant(
+                    session_id=session.id,
+                    username=username,
+                    role_label=role_label,
+                    device_label=device_label,
+                    join_state=join_state,
+                    hand_raised=hand_raised,
+                    muted=muted,
+                    camera_enabled=camera_enabled,
+                    screen_sharing=screen_sharing,
+                )
+            )
+    db.commit()
+
+    if db.query(WorkflowPlaybook).count():
+        playbook_notes = {
+            "Cyber Fraud Freeze Playbook": "Escalate bank-freeze and wallet-trace actions with cyber-fusion oversight.",
+            "SIM Swap Sweep Playbook": "Coordinate telecom and checkpoint actions around device swap indicators.",
+            "Retaliation Patrol Saturation": "Push district patrol saturation and corridor watch around hotspot surge.",
+        }
+        for row in db.query(WorkflowPlaybook).all():
+            if row.action_template_json:
+                continue
+            row.action_template_json = json.dumps([
+                "raise war room briefing",
+                "create task bundle",
+                "attach corridor watch",
+                playbook_notes.get(row.playbook_name, "Issue command briefing"),
+            ])
     db.commit()
     db.commit()
     db.close()

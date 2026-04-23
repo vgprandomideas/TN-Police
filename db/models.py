@@ -465,6 +465,157 @@ class CameraIncidentAssignment(Base):
     assigned_by = Column(String(80), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class OntologyClass(Base):
+    __tablename__ = "ontology_classes"
+    id = Column(Integer, primary_key=True)
+    class_name = Column(String(80), unique=True, nullable=False)
+    display_name = Column(String(120), nullable=False)
+    description = Column(Text)
+    category = Column(String(80), default="core")
+    attribute_schema_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class OntologyRelationType(Base):
+    __tablename__ = "ontology_relation_types"
+    id = Column(Integer, primary_key=True)
+    relation_name = Column(String(80), unique=True, nullable=False)
+    source_class = Column(String(80), nullable=False)
+    target_class = Column(String(80), nullable=False)
+    description = Column(Text)
+    directionality = Column(String(40), default="directed")
+    confidence_band = Column(String(40), default="medium")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class EntityAttributeFact(Base):
+    __tablename__ = "entity_attribute_facts"
+    id = Column(Integer, primary_key=True)
+    entity_id = Column(Integer, ForeignKey("entities.id"), nullable=False)
+    attribute_name = Column(String(120), nullable=False)
+    attribute_value = Column(String(255), nullable=False)
+    value_type = Column(String(60), default="string")
+    confidence = Column(Float, default=0.0)
+    source_name = Column(String(120))
+    source_ref = Column(String(180))
+    observed_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class EntityResolutionCandidate(Base):
+    __tablename__ = "entity_resolution_candidates"
+    id = Column(Integer, primary_key=True)
+    left_entity_id = Column(Integer, ForeignKey("entities.id"), nullable=False)
+    right_entity_id = Column(Integer, ForeignKey("entities.id"), nullable=False)
+    match_score = Column(Float, default=0.0)
+    rationale = Column(Text)
+    status = Column(String(40), default="pending")
+    cluster_ref = Column(String(120))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class EntityResolutionDecision(Base):
+    __tablename__ = "entity_resolution_decisions"
+    id = Column(Integer, primary_key=True)
+    candidate_id = Column(Integer, ForeignKey("entity_resolution_candidates.id"), nullable=False)
+    decision_status = Column(String(40), default="accepted")
+    decided_by = Column(String(80), nullable=False)
+    notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class ProvenanceRecord(Base):
+    __tablename__ = "provenance_records"
+    id = Column(Integer, primary_key=True)
+    object_type = Column(String(80), nullable=False)
+    object_id = Column(String(120), nullable=False)
+    district = Column(String(80))
+    source_name = Column(String(120), nullable=False)
+    source_type = Column(String(80), nullable=False)
+    source_ref = Column(String(180))
+    operation = Column(String(80), default="observed")
+    confidence = Column(Float, default=0.0)
+    collected_by = Column(String(80))
+    notes = Column(Text)
+    observed_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class ConnectorRun(Base):
+    __tablename__ = "connector_runs"
+    id = Column(Integer, primary_key=True)
+    connector_name = Column(String(120), nullable=False)
+    run_mode = Column(String(60), default="poll")
+    status = Column(String(40), default="completed")
+    records_seen = Column(Integer, default=0)
+    records_emitted = Column(Integer, default=0)
+    latency_ms = Column(Integer, default=0)
+    notes = Column(Text)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    finished_at = Column(DateTime)
+
+class ConnectorArtifact(Base):
+    __tablename__ = "connector_artifacts"
+    id = Column(Integer, primary_key=True)
+    connector_run_id = Column(Integer, ForeignKey("connector_runs.id"), nullable=False)
+    connector_name = Column(String(120), nullable=False)
+    record_type = Column(String(80), nullable=False)
+    external_ref = Column(String(180))
+    district = Column(String(80))
+    case_id = Column(Integer, ForeignKey("cases.id"), nullable=True)
+    entity_id = Column(Integer, ForeignKey("entities.id"), nullable=True)
+    ingest_summary = Column(Text)
+    status = Column(String(40), default="ingested")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class VideoSession(Base):
+    __tablename__ = "video_sessions"
+    id = Column(Integer, primary_key=True)
+    room_name = Column(String(120), nullable=False)
+    district = Column(String(80))
+    case_id = Column(Integer, ForeignKey("cases.id"), nullable=True)
+    session_code = Column(String(160), unique=True, nullable=False)
+    session_mode = Column(String(60), default="webrtc_mesh")
+    status = Column(String(40), default="active")
+    notes = Column(Text)
+    started_by = Column(String(80), nullable=False)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    ended_at = Column(DateTime)
+
+class VideoParticipant(Base):
+    __tablename__ = "video_participants"
+    id = Column(Integer, primary_key=True)
+    session_id = Column(Integer, ForeignKey("video_sessions.id"), nullable=False)
+    username = Column(String(80), nullable=False)
+    role_label = Column(String(80))
+    device_label = Column(String(120))
+    join_state = Column(String(40), default="connected")
+    hand_raised = Column(Boolean, default=False)
+    muted = Column(Boolean, default=False)
+    camera_enabled = Column(Boolean, default=True)
+    screen_sharing = Column(Boolean, default=False)
+    joined_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+
+class OperationalCorridor(Base):
+    __tablename__ = "operational_corridors"
+    id = Column(Integer, primary_key=True)
+    district = Column(String(80), nullable=False)
+    corridor_name = Column(String(160), nullable=False)
+    corridor_type = Column(String(80), default="movement")
+    route_ref = Column(String(120))
+    points_json = Column(Text, nullable=False)
+    risk_score = Column(Float, default=0.0)
+    surveillance_priority = Column(String(40), default="medium")
+    notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class WorkflowPlaybook(Base):
+    __tablename__ = "workflow_playbooks"
+    id = Column(Integer, primary_key=True)
+    district = Column(String(80), nullable=False)
+    playbook_name = Column(String(160), nullable=False)
+    trigger_type = Column(String(80), nullable=False)
+    default_priority = Column(String(40), default="medium")
+    assigned_unit_hint = Column(String(120))
+    action_template_json = Column(Text)
+    status = Column(String(40), default="active")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class GraphSnapshot(Base):
     __tablename__ = "graph_snapshots"
     id = Column(Integer, primary_key=True)

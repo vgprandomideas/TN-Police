@@ -5,6 +5,7 @@ import json
 import math
 import re
 from pathlib import Path
+from urllib.parse import quote
 from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import or_
@@ -17,7 +18,8 @@ from app.schemas import (
     CaseAssignCreate, ComplaintCaseLinkCreate, WatchlistCreate, EvidenceCreate,
     DepartmentMessageCreate, DepartmentMessageReadCreate, PresenceHeartbeatCreate, CheckpointPlanCreate,
     TypingHeartbeatCreate, GraphSavedViewCreate, GeofenceZoneCreate, CameraIncidentAssignmentCreate,
-    TaskCreate, TaskActionCreate
+    TaskCreate, TaskActionCreate, EntityResolutionActionCreate, ConnectorRunCreate,
+    VideoSessionCreate, VideoParticipantStateCreate, WorkflowPlaybookLaunchCreate
 )
 from db.database import get_db, SessionLocal
 from db.models import (
@@ -25,7 +27,16 @@ from db.models import (
     CaseComment, CaseAssignment, Incident, IngestQueue, ComplaintCaseLink, ConnectorRegistry,
     Watchlist, WatchlistHit, EvidenceAttachment, CaseTimelineEvent, StationRoutingRule,
     ProsecutionPacket, CustodyLog, MedicalCheckLog, EventCommandBoard,
-    DocumentIntake, ExtractedEntity, CourtHearing, PrisonMovement, NotificationEvent, DepartmentMessage, DepartmentMessageRead, MessageAttachment, RoomTypingSignal, PersonnelPresence, CheckpointPlan, GraphSavedView, GeoBoundary, GeofenceZone, CameraAsset, CameraIncidentAssignment, GraphSnapshot, GeoFenceAlert, AdapterStub, TaskQueue, TaskExecution, SuspectDossier, GraphInsight, CourtPacketExport, EvidenceIntegrityLog, NarrativeBrief, HotspotForecast, PatrolCoverageMetric, SimilarityHit, TimelineDigest, ExportJob, WarRoomSnapshot, ExplorationBookmark
+    DocumentIntake, ExtractedEntity, CourtHearing, PrisonMovement, NotificationEvent,
+    DepartmentMessage, DepartmentMessageRead, MessageAttachment, RoomTypingSignal,
+    PersonnelPresence, CheckpointPlan, GraphSavedView, GeoBoundary, GeofenceZone, CameraAsset,
+    CameraIncidentAssignment, GraphSnapshot, GeoFenceAlert, AdapterStub, TaskQueue,
+    TaskExecution, SuspectDossier, GraphInsight, CourtPacketExport, EvidenceIntegrityLog,
+    NarrativeBrief, HotspotForecast, PatrolCoverageMetric, SimilarityHit, TimelineDigest,
+    ExportJob, WarRoomSnapshot, ExplorationBookmark, OntologyClass, OntologyRelationType,
+    EntityAttributeFact, EntityResolutionCandidate, EntityResolutionDecision, ProvenanceRecord,
+    ConnectorRun, ConnectorArtifact, VideoSession, VideoParticipant, OperationalCorridor,
+    WorkflowPlaybook
 )
 from services.auth import verify_password, create_access_token
 from services.permissions import (
@@ -160,6 +171,196 @@ def department_attachment_lookup(db: Session, message_ids: list[int]) -> dict[in
             }
         )
     return grouped
+
+
+def safe_json_list(payload: str | None) -> list:
+    if not payload:
+        return []
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError:
+        return []
+    return value if isinstance(value, list) else []
+
+
+def simple_slug(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", str(value or "").strip().lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug or "ops"
+
+
+def serialize_entity(entity: Entity) -> dict:
+    return {
+        "id": entity.id,
+        "name": entity.display_name,
+        "type": entity.entity_type,
+        "district": entity.district,
+        "risk_score": entity.risk_score,
+    }
+
+
+def entity_lookup_map(db: Session) -> dict[int, Entity]:
+    return {row.id: row for row in db.query(Entity).all()}
+
+
+def entity_resolution_candidate_payload(
+    row: EntityResolutionCandidate,
+    entity_lookup: dict[int, Entity],
+) -> dict:
+    left_entity = entity_lookup.get(row.left_entity_id)
+    right_entity = entity_lookup.get(row.right_entity_id)
+    return {
+        "id": row.id,
+        "left_entity_id": row.left_entity_id,
+        "left_entity_name": None if left_entity is None else left_entity.display_name,
+        "left_entity_type": None if left_entity is None else left_entity.entity_type,
+        "left_district": None if left_entity is None else left_entity.district,
+        "right_entity_id": row.right_entity_id,
+        "right_entity_name": None if right_entity is None else right_entity.display_name,
+        "right_entity_type": None if right_entity is None else right_entity.entity_type,
+        "right_district": None if right_entity is None else right_entity.district,
+        "match_score": row.match_score,
+        "rationale": row.rationale,
+        "status": row.status,
+        "cluster_ref": row.cluster_ref,
+        "created_at": row.created_at.isoformat(),
+    }
+
+
+def serialize_connector_run(row: ConnectorRun) -> dict:
+    duration_ms = None
+    if row.started_at and row.finished_at:
+        duration_ms = int((row.finished_at - row.started_at).total_seconds() * 1000)
+    return {
+        "id": row.id,
+        "connector_name": row.connector_name,
+        "run_mode": row.run_mode,
+        "status": row.status,
+        "records_seen": row.records_seen,
+        "records_emitted": row.records_emitted,
+        "latency_ms": row.latency_ms,
+        "notes": row.notes,
+        "started_at": None if row.started_at is None else row.started_at.isoformat(),
+        "finished_at": None if row.finished_at is None else row.finished_at.isoformat(),
+        "duration_ms": duration_ms,
+    }
+
+
+def serialize_connector_artifact(row: ConnectorArtifact, entity_lookup: dict[int, Entity] | None = None) -> dict:
+    entity_name = None
+    if entity_lookup and row.entity_id:
+        entity_name = getattr(entity_lookup.get(row.entity_id), "display_name", None)
+    return {
+        "id": row.id,
+        "connector_run_id": row.connector_run_id,
+        "connector_name": row.connector_name,
+        "record_type": row.record_type,
+        "external_ref": row.external_ref,
+        "district": row.district,
+        "case_id": row.case_id,
+        "entity_id": row.entity_id,
+        "entity_name": entity_name,
+        "ingest_summary": row.ingest_summary,
+        "status": row.status,
+        "created_at": row.created_at.isoformat(),
+    }
+
+
+def video_room_name(session_code: str) -> str:
+    return f"video::{session_code}"
+
+
+def build_video_join_url(session_code: str, username: str) -> str:
+    safe_code = simple_slug(session_code)
+    safe_username = quote(username or "Analyst")
+    return (
+        f"https://meet.jit.si/{safe_code}"
+        f"#userInfo.displayName=\"{safe_username}\""
+        "&config.prejoinPageEnabled=false"
+    )
+
+
+def serialize_video_session(row: VideoSession, current_username: str | None = None) -> dict:
+    return {
+        "id": row.id,
+        "room_name": row.room_name,
+        "district": row.district,
+        "case_id": row.case_id,
+        "session_code": row.session_code,
+        "session_mode": row.session_mode,
+        "status": row.status,
+        "notes": row.notes,
+        "started_by": row.started_by,
+        "started_at": None if row.started_at is None else row.started_at.isoformat(),
+        "ended_at": None if row.ended_at is None else row.ended_at.isoformat(),
+        "join_url": build_video_join_url(row.session_code, current_username or row.started_by),
+        "signal_room": video_room_name(row.session_code),
+    }
+
+
+def serialize_video_participant(row: VideoParticipant) -> dict:
+    return {
+        "id": row.id,
+        "session_id": row.session_id,
+        "username": row.username,
+        "role_label": row.role_label,
+        "device_label": row.device_label,
+        "join_state": row.join_state,
+        "hand_raised": row.hand_raised,
+        "muted": row.muted,
+        "camera_enabled": row.camera_enabled,
+        "screen_sharing": row.screen_sharing,
+        "joined_at": None if row.joined_at is None else row.joined_at.isoformat(),
+        "last_seen_at": None if row.last_seen_at is None else row.last_seen_at.isoformat(),
+    }
+
+
+def serialize_playbook(row: WorkflowPlaybook) -> dict:
+    return {
+        "id": row.id,
+        "district": row.district,
+        "playbook_name": row.playbook_name,
+        "trigger_type": row.trigger_type,
+        "default_priority": row.default_priority,
+        "assigned_unit_hint": row.assigned_unit_hint,
+        "action_template": safe_json_list(row.action_template_json),
+        "status": row.status,
+        "created_at": row.created_at.isoformat(),
+    }
+
+
+def create_playbook_task(
+    db: Session,
+    *,
+    task_type: str,
+    district: str,
+    priority: str,
+    assigned_unit: str | None,
+    details: str,
+    created_by: str,
+    case_id: int | None = None,
+) -> TaskQueue:
+    row = TaskQueue(
+        case_id=case_id,
+        district=district,
+        task_type=task_type,
+        priority=priority,
+        assigned_unit=assigned_unit,
+        status="queued",
+        details=details,
+        created_by=created_by,
+    )
+    db.add(row)
+    db.flush()
+    db.add(
+        TaskExecution(
+            task_id=row.id,
+            actor=created_by,
+            action="playbook_launch",
+            notes=f"Created from workflow playbook. Assigned unit: {assigned_unit or 'unassigned'}.",
+        )
+    )
+    return row
 
 
 def typing_signal_rows(db: Session, room_name: str | None = None, district: str | None = None) -> list[RoomTypingSignal]:
@@ -1411,6 +1612,817 @@ def create_graph_saved_view(
     db.commit()
     return {"status": "created", "saved_view_id": row.id}
 
+
+@app.get('/ontology/classes')
+def ontology_classes(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rows = db.query(OntologyClass).order_by(OntologyClass.category, OntologyClass.display_name).all()
+    return [
+        {
+            "id": row.id,
+            "class_name": row.class_name,
+            "display_name": row.display_name,
+            "description": row.description,
+            "category": row.category,
+            "attribute_schema": safe_json_list(row.attribute_schema_json),
+            "created_at": row.created_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@app.get('/ontology/relationship-types')
+def ontology_relationship_types(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rows = db.query(OntologyRelationType).order_by(OntologyRelationType.relation_name).all()
+    return [
+        {
+            "id": row.id,
+            "relation_name": row.relation_name,
+            "source_class": row.source_class,
+            "target_class": row.target_class,
+            "description": row.description,
+            "directionality": row.directionality,
+            "confidence_band": row.confidence_band,
+            "created_at": row.created_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@app.get('/ontology/attribute-facts')
+def ontology_attribute_facts(
+    entity_id: int | None = None,
+    district: str | None = None,
+    attribute_name: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(EntityAttributeFact, Entity).join(Entity, EntityAttributeFact.entity_id == Entity.id)
+    if entity_id:
+        q = q.filter(EntityAttributeFact.entity_id == entity_id)
+    if district:
+        q = q.filter(Entity.district == district)
+    if attribute_name:
+        q = q.filter(EntityAttributeFact.attribute_name == attribute_name)
+    rows = q.order_by(EntityAttributeFact.observed_at.desc(), EntityAttributeFact.id.desc()).all()
+    return [
+        {
+            "id": fact.id,
+            "entity_id": fact.entity_id,
+            "entity_name": entity.display_name,
+            "entity_type": entity.entity_type,
+            "district": entity.district,
+            "attribute_name": fact.attribute_name,
+            "attribute_value": fact.attribute_value,
+            "value_type": fact.value_type,
+            "confidence": fact.confidence,
+            "source_name": fact.source_name,
+            "source_ref": fact.source_ref,
+            "observed_at": fact.observed_at.isoformat(),
+        }
+        for fact, entity in rows
+    ]
+
+
+@app.get('/ontology/entities/{entity_id}/profile')
+def ontology_entity_profile(
+    entity_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    entity = db.query(Entity).filter(Entity.id == entity_id).first()
+    if not entity:
+        raise HTTPException(status_code=404, detail='Entity not found')
+
+    attribute_rows = db.query(EntityAttributeFact).filter(EntityAttributeFact.entity_id == entity_id).order_by(EntityAttributeFact.confidence.desc()).all()
+    candidate_rows = db.query(EntityResolutionCandidate).filter(
+        or_(EntityResolutionCandidate.left_entity_id == entity_id, EntityResolutionCandidate.right_entity_id == entity_id)
+    ).order_by(EntityResolutionCandidate.match_score.desc()).all()
+    candidate_ids = [row.id for row in candidate_rows]
+    decision_rows = db.query(EntityResolutionDecision).filter(EntityResolutionDecision.candidate_id.in_(candidate_ids)).order_by(EntityResolutionDecision.created_at.desc()).all() if candidate_ids else []
+    provenance_rows = db.query(ProvenanceRecord).filter(
+        or_(
+            (ProvenanceRecord.object_type == "entity") & (ProvenanceRecord.object_id == str(entity_id)),
+            ProvenanceRecord.source_ref == str(entity_id),
+        )
+    ).order_by(ProvenanceRecord.observed_at.desc()).all()
+    artifact_rows = db.query(ConnectorArtifact).filter(ConnectorArtifact.entity_id == entity_id).order_by(ConnectorArtifact.created_at.desc()).all()
+    watchlist_rows = db.query(WatchlistHit).filter(WatchlistHit.entity_id == entity_id).order_by(WatchlistHit.created_at.desc()).all()
+    link_rows = db.query(EntityLink).filter(
+        or_(EntityLink.source_entity_id == entity_id, EntityLink.target_entity_id == entity_id)
+    ).order_by(EntityLink.weight.desc()).all()
+    entity_lookup = entity_lookup_map(db)
+
+    neighbor_rows = []
+    for row in link_rows:
+        peer_id = row.target_entity_id if row.source_entity_id == entity_id else row.source_entity_id
+        peer = entity_lookup.get(peer_id)
+        if not peer:
+            continue
+        neighbor_rows.append(
+            {
+                "peer_entity_id": peer.id,
+                "peer_entity_name": peer.display_name,
+                "peer_entity_type": peer.entity_type,
+                "peer_district": peer.district,
+                "relationship_type": row.relationship_type,
+                "weight": row.weight,
+            }
+        )
+
+    return {
+        "entity": serialize_entity(entity),
+        "attributes": [
+            {
+                "attribute_name": row.attribute_name,
+                "attribute_value": row.attribute_value,
+                "value_type": row.value_type,
+                "confidence": row.confidence,
+                "source_name": row.source_name,
+                "source_ref": row.source_ref,
+                "observed_at": row.observed_at.isoformat(),
+            }
+            for row in attribute_rows
+        ],
+        "resolution_candidates": [entity_resolution_candidate_payload(row, entity_lookup) for row in candidate_rows],
+        "resolution_decisions": [
+            {
+                "id": row.id,
+                "candidate_id": row.candidate_id,
+                "decision_status": row.decision_status,
+                "decided_by": row.decided_by,
+                "notes": row.notes,
+                "created_at": row.created_at.isoformat(),
+            }
+            for row in decision_rows
+        ],
+        "provenance": [
+            {
+                "id": row.id,
+                "object_type": row.object_type,
+                "object_id": row.object_id,
+                "district": row.district,
+                "source_name": row.source_name,
+                "source_type": row.source_type,
+                "source_ref": row.source_ref,
+                "operation": row.operation,
+                "confidence": row.confidence,
+                "collected_by": row.collected_by,
+                "notes": row.notes,
+                "observed_at": row.observed_at.isoformat(),
+            }
+            for row in provenance_rows
+        ],
+        "connector_artifacts": [serialize_connector_artifact(row, entity_lookup=entity_lookup) for row in artifact_rows],
+        "watchlist_hits": [
+            {
+                "id": row.id,
+                "watchlist_id": row.watchlist_id,
+                "case_id": row.case_id,
+                "incident_id": row.incident_id,
+                "hit_reason": row.hit_reason,
+                "confidence": row.confidence,
+                "created_at": row.created_at.isoformat(),
+            }
+            for row in watchlist_rows
+        ],
+        "neighbors": neighbor_rows,
+    }
+
+
+@app.get('/entity-resolution/candidates')
+def entity_resolution_candidates(
+    district: str | None = None,
+    status: str | None = None,
+    entity_id: int | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    rows = db.query(EntityResolutionCandidate).order_by(EntityResolutionCandidate.match_score.desc(), EntityResolutionCandidate.id.desc()).all()
+    entity_lookup = entity_lookup_map(db)
+    output = []
+    for row in rows:
+        left_entity = entity_lookup.get(row.left_entity_id)
+        right_entity = entity_lookup.get(row.right_entity_id)
+        if district and district not in {getattr(left_entity, "district", None), getattr(right_entity, "district", None)}:
+            continue
+        if status and row.status != status:
+            continue
+        if entity_id and entity_id not in {row.left_entity_id, row.right_entity_id}:
+            continue
+        output.append(entity_resolution_candidate_payload(row, entity_lookup))
+    return output
+
+
+@app.get('/entity-resolution/decisions')
+def entity_resolution_decisions(
+    district: str | None = None,
+    candidate_id: int | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    candidate_lookup = {row.id: row for row in db.query(EntityResolutionCandidate).all()}
+    entity_lookup = entity_lookup_map(db)
+    q = db.query(EntityResolutionDecision)
+    if candidate_id:
+        q = q.filter(EntityResolutionDecision.candidate_id == candidate_id)
+    rows = q.order_by(EntityResolutionDecision.created_at.desc()).all()
+    output = []
+    for row in rows:
+        candidate = candidate_lookup.get(row.candidate_id)
+        if not candidate:
+            continue
+        candidate_payload = entity_resolution_candidate_payload(candidate, entity_lookup)
+        if district and district not in {candidate_payload.get("left_district"), candidate_payload.get("right_district")}:
+            continue
+        output.append(
+            {
+                "id": row.id,
+                "candidate_id": row.candidate_id,
+                "decision_status": row.decision_status,
+                "decided_by": row.decided_by,
+                "notes": row.notes,
+                "created_at": row.created_at.isoformat(),
+                "left_entity_name": candidate_payload.get("left_entity_name"),
+                "right_entity_name": candidate_payload.get("right_entity_name"),
+                "cluster_ref": candidate_payload.get("cluster_ref"),
+            }
+        )
+    return output
+
+
+@app.post('/entity-resolution/resolve')
+def entity_resolution_resolve(
+    body: EntityResolutionActionCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    candidate = db.query(EntityResolutionCandidate).filter(EntityResolutionCandidate.id == body.candidate_id).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail='Resolution candidate not found')
+
+    candidate.status = body.decision_status
+    decision = EntityResolutionDecision(
+        candidate_id=candidate.id,
+        decision_status=body.decision_status,
+        decided_by=user.username,
+        notes=body.notes,
+    )
+    db.add(decision)
+
+    if body.decision_status == "accepted":
+        link_exists = db.query(EntityLink).filter_by(
+            source_entity_id=candidate.left_entity_id,
+            target_entity_id=candidate.right_entity_id,
+            relationship_type="resolved_same_entity",
+        ).first()
+        if not link_exists:
+            db.add(
+                EntityLink(
+                    source_entity_id=candidate.left_entity_id,
+                    target_entity_id=candidate.right_entity_id,
+                    relationship_type="resolved_same_entity",
+                    weight=max(candidate.match_score, 0.8),
+                )
+            )
+
+    db.add(
+        ProvenanceRecord(
+            object_type="resolution_candidate",
+            object_id=str(candidate.id),
+            district=None,
+            source_name="entity_resolution_workbench",
+            source_type="analyst_decision",
+            source_ref=candidate.cluster_ref or str(candidate.id),
+            operation=body.decision_status,
+            confidence=candidate.match_score,
+            collected_by=user.username,
+            notes=body.notes or f"Resolution candidate set to {body.decision_status}.",
+        )
+    )
+    log_action(db, user.username, 'resolve_entity_candidate', 'entity_resolution_candidate', str(candidate.id))
+    db.commit()
+    return {
+        "status": "ok",
+        "candidate_id": candidate.id,
+        "decision_status": decision.decision_status,
+        "decision_id": decision.id,
+    }
+
+
+@app.get('/provenance/records')
+def provenance_records(
+    object_type: str | None = None,
+    object_id: str | None = None,
+    district: str | None = None,
+    entity_id: int | None = None,
+    case_id: int | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(ProvenanceRecord)
+    if object_type:
+        q = q.filter(ProvenanceRecord.object_type == object_type)
+    if object_id:
+        q = q.filter(ProvenanceRecord.object_id == object_id)
+    if district:
+        q = q.filter(ProvenanceRecord.district == district)
+    if entity_id:
+        q = q.filter(ProvenanceRecord.object_type == "entity", ProvenanceRecord.object_id == str(entity_id))
+    if case_id:
+        q = q.filter(ProvenanceRecord.object_type == "case", ProvenanceRecord.object_id == str(case_id))
+    rows = q.order_by(ProvenanceRecord.observed_at.desc(), ProvenanceRecord.id.desc()).all()
+    return [
+        {
+            "id": row.id,
+            "object_type": row.object_type,
+            "object_id": row.object_id,
+            "district": row.district,
+            "source_name": row.source_name,
+            "source_type": row.source_type,
+            "source_ref": row.source_ref,
+            "operation": row.operation,
+            "confidence": row.confidence,
+            "collected_by": row.collected_by,
+            "notes": row.notes,
+            "observed_at": row.observed_at.isoformat(),
+            "created_at": row.created_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@app.get('/connectors/runs')
+def connector_runs(
+    connector_name: str | None = None,
+    status: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(ConnectorRun)
+    if connector_name:
+        q = q.filter(ConnectorRun.connector_name == connector_name)
+    if status:
+        q = q.filter(ConnectorRun.status == status)
+    rows = q.order_by(ConnectorRun.id.desc()).all()
+    return [serialize_connector_run(row) for row in rows]
+
+
+@app.get('/connectors/artifacts')
+def connector_artifacts(
+    connector_name: str | None = None,
+    district: str | None = None,
+    case_id: int | None = None,
+    entity_id: int | None = None,
+    status: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(ConnectorArtifact)
+    if connector_name:
+        q = q.filter(ConnectorArtifact.connector_name == connector_name)
+    if district:
+        q = q.filter(ConnectorArtifact.district == district)
+    if case_id:
+        q = q.filter(ConnectorArtifact.case_id == case_id)
+    if entity_id:
+        q = q.filter(ConnectorArtifact.entity_id == entity_id)
+    if status:
+        q = q.filter(ConnectorArtifact.status == status)
+    rows = q.order_by(ConnectorArtifact.id.desc()).all()
+    entity_lookup = entity_lookup_map(db)
+    return [serialize_connector_artifact(row, entity_lookup=entity_lookup) for row in rows]
+
+
+@app.post('/connectors/runs/trigger')
+def trigger_connector_run(
+    body: ConnectorRunCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    timestamp_tag = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    run = ConnectorRun(
+        connector_name=body.connector_name,
+        run_mode=body.run_mode,
+        status="completed",
+        records_seen=0,
+        records_emitted=0,
+        latency_ms=420,
+        notes=body.notes or f"Manual connector trigger by {user.username}.",
+        started_at=datetime.utcnow(),
+        finished_at=datetime.utcnow(),
+    )
+    db.add(run)
+    db.flush()
+
+    entity_rows = {row.display_name: row for row in db.query(Entity).all()}
+    case_rows = {row.title: row for row in db.query(Case).all()}
+    artifact_blueprints = {
+        "tn_cctns_citizen_portal": [
+            ("complaint", f"CMP-REF-001-RUN-{timestamp_tag}", "Chennai", case_rows.get("Chennai wallet scam cluster"), entity_rows.get("Ravi Kumar"), "Citizen complaint complaint packet synchronized into operations fabric."),
+        ],
+        "national_cybercrime_portal": [
+            ("alias_profile", f"NCCRP-RK-{timestamp_tag}", "Chennai", case_rows.get("Chennai wallet scam cluster"), entity_rows.get("R. Kumar"), "Alias profile artifact synced from cybercrime portal watchlist lane."),
+        ],
+        "patrol_reporting_ingest": [
+            ("patrol_update", f"PATROL-MDU-{timestamp_tag}", "Madurai", case_rows.get("Madurai retaliation watch"), entity_rows.get("Sathish"), "Patrol update ingested for retaliation saturation corridor."),
+        ],
+        "cctv_event_bridge": [
+            ("camera_event", f"CCTV-CHE-{timestamp_tag}", "Chennai", case_rows.get("Chennai wallet scam cluster"), entity_rows.get("IMEI-8899-XX"), "Camera anomaly artifact linked to the active fraud command thread."),
+        ],
+    }
+    blueprints = artifact_blueprints.get(body.connector_name, [
+        ("connector_record", f"{simple_slug(body.connector_name).upper()}-{timestamp_tag}", None, None, None, "Connector run completed without a mapped artifact blueprint."),
+    ])
+
+    emitted_count = 0
+    for record_type, external_ref, artifact_district, artifact_case, artifact_entity, ingest_summary in blueprints:
+        db.add(
+            ConnectorArtifact(
+                connector_run_id=run.id,
+                connector_name=body.connector_name,
+                record_type=record_type,
+                external_ref=external_ref,
+                district=artifact_district,
+                case_id=None if artifact_case is None else artifact_case.id,
+                entity_id=None if artifact_entity is None else artifact_entity.id,
+                ingest_summary=ingest_summary,
+                status="ingested",
+            )
+        )
+        emitted_count += 1
+
+    run.records_seen = emitted_count + 2
+    run.records_emitted = emitted_count
+    db.add(
+        IngestQueue(
+            source_name=body.connector_name,
+            payload_ref=f"manual-trigger:{timestamp_tag}",
+            status="processed",
+            processed_at=datetime.utcnow(),
+        )
+    )
+    db.add(
+        NotificationEvent(
+            notification_type="connector_run",
+            channel="in_app",
+            recipient=user.username,
+            subject=f"{body.connector_name} connector run completed",
+            message=f"Connector run emitted {emitted_count} operational artifact(s).",
+            status="queued",
+            related_object_type="connector_run",
+            related_object_id=str(run.id),
+        )
+    )
+    log_action(db, user.username, 'trigger_connector_run', 'connector_run', str(run.id))
+    db.commit()
+    return {
+        "status": "ok",
+        "run": serialize_connector_run(run),
+        "artifacts_created": emitted_count,
+    }
+
+
+@app.get('/video/sessions')
+def list_video_sessions(
+    district: str | None = None,
+    status: str | None = None,
+    room_name: str | None = None,
+    case_id: int | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(VideoSession)
+    current_role = role_name(db, user)
+    if current_role == "district_sp" and user.district:
+        q = q.filter(or_(VideoSession.district == user.district, VideoSession.district == None))
+    elif district:
+        q = q.filter(or_(VideoSession.district == district, VideoSession.district == None))
+    if status:
+        q = q.filter(VideoSession.status == status)
+    if room_name:
+        q = q.filter(VideoSession.room_name == room_name)
+    if case_id:
+        q = q.filter(VideoSession.case_id == case_id)
+    rows = q.order_by(VideoSession.started_at.desc(), VideoSession.id.desc()).all()
+    participant_rows = db.query(VideoParticipant).all()
+    participant_counts = defaultdict(int)
+    hand_raise_counts = defaultdict(int)
+    screen_share_counts = defaultdict(int)
+    for participant in participant_rows:
+        participant_counts[participant.session_id] += 1
+        hand_raise_counts[participant.session_id] += 1 if participant.hand_raised else 0
+        screen_share_counts[participant.session_id] += 1 if participant.screen_sharing else 0
+    output = []
+    for row in rows:
+        payload = serialize_video_session(row, current_username=user.username)
+        payload["participant_count"] = participant_counts.get(row.id, 0)
+        payload["raised_hands"] = hand_raise_counts.get(row.id, 0)
+        payload["screen_shares"] = screen_share_counts.get(row.id, 0)
+        output.append(payload)
+    return output
+
+
+@app.post('/video/sessions')
+def create_video_session(
+    body: VideoSessionCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    district_scope = body.district or user.district
+    session_code_base = f"tn-police-{simple_slug(district_scope or 'statewide')}-{simple_slug(body.room_name)}-{body.case_id or 'ops'}"
+    row = db.query(VideoSession).filter(
+        VideoSession.session_code == session_code_base,
+        VideoSession.status == "active",
+    ).first()
+    created = False
+    if not row:
+        row = VideoSession(
+            room_name=body.room_name,
+            district=district_scope,
+            case_id=body.case_id,
+            session_code=session_code_base,
+            session_mode=body.session_mode,
+            status="active",
+            notes=body.notes,
+            started_by=user.username,
+        )
+        db.add(row)
+        db.flush()
+        created = True
+
+    participant = db.query(VideoParticipant).filter(
+        VideoParticipant.session_id == row.id,
+        VideoParticipant.username == user.username,
+    ).first()
+    if not participant:
+        participant = VideoParticipant(
+            session_id=row.id,
+            username=user.username,
+            role_label=role_name(db, user),
+            device_label="Browser console",
+            join_state="connected",
+            muted=False,
+            camera_enabled=True,
+            screen_sharing=False,
+        )
+        db.add(participant)
+
+    db.add(
+        NotificationEvent(
+            notification_type="video_session",
+            channel="in_app",
+            recipient=body.room_name,
+            subject=f"Video briefing {row.session_code}",
+            message=f"{user.username} {'created' if created else 'rejoined'} the video session.",
+            status="queued",
+            related_object_type="video_session",
+            related_object_id=str(row.id),
+        )
+    )
+    log_action(db, user.username, 'create_video_session', 'video_session', str(row.id))
+    db.commit()
+    payload = serialize_video_session(row, current_username=user.username)
+    payload["event_type"] = "session_created" if created else "session_joined"
+    dispatch_realtime_payload(video_room_name(row.session_code), payload)
+    return {
+        "status": "created" if created else "existing",
+        "session": serialize_video_session(row, current_username=user.username),
+    }
+
+
+@app.get('/video/sessions/{session_code}/participants')
+def list_video_participants(
+    session_code: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    session_row = db.query(VideoSession).filter(VideoSession.session_code == session_code).first()
+    if not session_row:
+        raise HTTPException(status_code=404, detail='Video session not found')
+    rows = db.query(VideoParticipant).filter(VideoParticipant.session_id == session_row.id).order_by(VideoParticipant.last_seen_at.desc()).all()
+    current_time = datetime.utcnow()
+    output = []
+    for row in rows:
+        payload = serialize_video_participant(row)
+        payload["seconds_since_seen"] = int((current_time - row.last_seen_at).total_seconds()) if row.last_seen_at else None
+        payload["is_online"] = payload["seconds_since_seen"] is not None and payload["seconds_since_seen"] <= 150
+        output.append(payload)
+    return output
+
+
+@app.post('/video/sessions/{session_code}/participant-state')
+def update_video_participant_state(
+    session_code: str,
+    body: VideoParticipantStateCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    session_row = db.query(VideoSession).filter(VideoSession.session_code == session_code).first()
+    if not session_row:
+        raise HTTPException(status_code=404, detail='Video session not found')
+    participant = db.query(VideoParticipant).filter(
+        VideoParticipant.session_id == session_row.id,
+        VideoParticipant.username == user.username,
+    ).first()
+    if not participant:
+        participant = VideoParticipant(
+            session_id=session_row.id,
+            username=user.username,
+            role_label=role_name(db, user),
+        )
+        db.add(participant)
+    if body.device_label is not None:
+        participant.device_label = body.device_label
+    if body.join_state is not None:
+        participant.join_state = body.join_state
+    if body.hand_raised is not None:
+        participant.hand_raised = body.hand_raised
+    if body.muted is not None:
+        participant.muted = body.muted
+    if body.camera_enabled is not None:
+        participant.camera_enabled = body.camera_enabled
+    if body.screen_sharing is not None:
+        participant.screen_sharing = body.screen_sharing
+    participant.last_seen_at = datetime.utcnow()
+    db.commit()
+    payload = serialize_video_participant(participant)
+    payload["event_type"] = "participant_state"
+    payload["session_code"] = session_code
+    dispatch_realtime_payload(video_room_name(session_code), payload)
+    return {"status": "ok", "participant": payload}
+
+
+@app.websocket('/video/sessions/{session_code}/ws')
+async def video_session_ws(websocket: WebSocket, session_code: str):
+    token = websocket.query_params.get("token")
+    db = SessionLocal()
+    try:
+        if not token:
+            await websocket.close(code=4401)
+            return
+        try:
+            user = current_user_from_token(token, db)
+        except HTTPException:
+            await websocket.close(code=4401)
+            return
+        session_row = db.query(VideoSession).filter(VideoSession.session_code == session_code).first()
+        if not session_row:
+            await websocket.close(code=4404)
+            return
+        await realtime_manager.connect(video_room_name(session_code), websocket)
+        await websocket.send_json(
+            {
+                "event_type": "connected",
+                "session_code": session_code,
+                "room_name": session_row.room_name,
+                "username": user.username,
+            }
+        )
+        while True:
+            signal_text = await websocket.receive_text()
+            await realtime_manager.broadcast(
+                video_room_name(session_code),
+                {
+                    "event_type": "signal",
+                    "session_code": session_code,
+                    "username": user.username,
+                    "payload": signal_text[:500],
+                },
+            )
+    except WebSocketDisconnect:
+        realtime_manager.disconnect(video_room_name(session_code), websocket)
+    finally:
+        db.close()
+
+
+@app.get('/geo/corridors')
+def geo_corridors(
+    district: str | None = None,
+    corridor_type: str | None = None,
+    route_ref: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(OperationalCorridor)
+    if district:
+        q = q.filter(OperationalCorridor.district == district)
+    if corridor_type:
+        q = q.filter(OperationalCorridor.corridor_type == corridor_type)
+    if route_ref:
+        q = q.filter(OperationalCorridor.route_ref == route_ref)
+    rows = q.order_by(OperationalCorridor.risk_score.desc(), OperationalCorridor.id.desc()).all()
+    return [
+        {
+            "id": row.id,
+            "district": row.district,
+            "corridor_name": row.corridor_name,
+            "corridor_type": row.corridor_type,
+            "route_ref": row.route_ref,
+            "points": safe_json_list(row.points_json),
+            "risk_score": row.risk_score,
+            "surveillance_priority": row.surveillance_priority,
+            "notes": row.notes,
+            "created_at": row.created_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@app.get('/workflow/playbooks')
+def workflow_playbooks(
+    district: str | None = None,
+    trigger_type: str | None = None,
+    status: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    q = db.query(WorkflowPlaybook)
+    current_role = role_name(db, user)
+    if current_role == "district_sp" and user.district:
+        q = q.filter(WorkflowPlaybook.district == user.district)
+    elif district:
+        q = q.filter(WorkflowPlaybook.district == district)
+    if trigger_type:
+        q = q.filter(WorkflowPlaybook.trigger_type == trigger_type)
+    if status:
+        q = q.filter(WorkflowPlaybook.status == status)
+    rows = q.order_by(WorkflowPlaybook.district, WorkflowPlaybook.playbook_name).all()
+    return [serialize_playbook(row) for row in rows]
+
+
+@app.post('/workflow/playbooks/{playbook_id}/launch')
+def workflow_playbook_launch(
+    playbook_id: int,
+    body: WorkflowPlaybookLaunchCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    playbook = db.query(WorkflowPlaybook).filter(WorkflowPlaybook.id == playbook_id).first()
+    if not playbook:
+        raise HTTPException(status_code=404, detail='Playbook not found')
+
+    target_district = body.district or playbook.district
+    assigned_unit = body.assigned_unit or playbook.assigned_unit_hint
+    action_templates = safe_json_list(playbook.action_template_json)
+    created_task_ids: list[int] = []
+    created_checkpoint_ids: list[int] = []
+    for action_name in action_templates:
+        task = create_playbook_task(
+            db,
+            task_type=simple_slug(action_name),
+            district=target_district,
+            priority=playbook.default_priority,
+            assigned_unit=assigned_unit,
+            details=f"{playbook.playbook_name}: {action_name}. {body.notes or ''}".strip(),
+            created_by=user.username,
+            case_id=body.case_id,
+        )
+        created_task_ids.append(task.id)
+
+    corridor = db.query(OperationalCorridor).filter(OperationalCorridor.district == target_district).order_by(OperationalCorridor.risk_score.desc()).first()
+    if corridor:
+        corridor_points = safe_json_list(corridor.points_json)
+        first_point = corridor_points[0] if corridor_points else {}
+        checkpoint = CheckpointPlan(
+            district=target_district,
+            checkpoint_name=f"{playbook.playbook_name} Checkpoint",
+            checkpoint_type="playbook_lock",
+            route_ref=corridor.route_ref,
+            status="planned",
+            assigned_unit=assigned_unit,
+            latitude=first_point.get("latitude"),
+            longitude=first_point.get("longitude"),
+            case_id=body.case_id,
+            notes=f"Checkpoint created from {playbook.playbook_name}. {body.notes or ''}".strip(),
+            created_by=user.username,
+        )
+        db.add(checkpoint)
+        db.flush()
+        created_checkpoint_ids.append(checkpoint.id)
+
+    if body.case_id:
+        add_timeline(db, body.case_id, "playbook_launched", user.username, f"{playbook.playbook_name} launched with {len(created_task_ids)} tasks.")
+    db.add(
+        NotificationEvent(
+            notification_type="workflow_playbook",
+            channel="in_app",
+            recipient=assigned_unit or target_district,
+            subject=f"{playbook.playbook_name} launched",
+            message=f"{len(created_task_ids)} tasks and {len(created_checkpoint_ids)} checkpoints created.",
+            status="queued",
+            related_object_type="workflow_playbook",
+            related_object_id=str(playbook.id),
+        )
+    )
+    log_action(db, user.username, 'launch_workflow_playbook', 'workflow_playbook', str(playbook.id))
+    db.commit()
+    return {
+        "status": "ok",
+        "playbook_id": playbook.id,
+        "task_ids": created_task_ids,
+        "checkpoint_ids": created_checkpoint_ids,
+    }
+
 @app.get('/geo/geofence-alerts')
 def geofence_alerts(district: str | None = None, active: bool | None = None, db: Session = Depends(get_db), user: User = Depends(current_user)):
     q = db.query(GeoFenceAlert)
@@ -1819,6 +2831,11 @@ def unified_search(
     checkpoints_q = db.query(CheckpointPlan).filter(or_(CheckpointPlan.checkpoint_name.ilike(q_like), CheckpointPlan.notes.ilike(q_like)))
     geofences_q = db.query(GeofenceZone).filter(or_(GeofenceZone.zone_name.ilike(q_like), GeofenceZone.notes.ilike(q_like)))
     cameras_q = db.query(CameraAsset).filter(or_(CameraAsset.camera_id.ilike(q_like), CameraAsset.zone_name.ilike(q_like), CameraAsset.owner_unit.ilike(q_like)))
+    connector_artifacts_q = db.query(ConnectorArtifact).filter(or_(ConnectorArtifact.connector_name.ilike(q_like), ConnectorArtifact.external_ref.ilike(q_like), ConnectorArtifact.ingest_summary.ilike(q_like)))
+    provenance_q = db.query(ProvenanceRecord).filter(or_(ProvenanceRecord.source_name.ilike(q_like), ProvenanceRecord.source_ref.ilike(q_like), ProvenanceRecord.notes.ilike(q_like), ProvenanceRecord.operation.ilike(q_like)))
+    corridors_q = db.query(OperationalCorridor).filter(or_(OperationalCorridor.corridor_name.ilike(q_like), OperationalCorridor.corridor_type.ilike(q_like), OperationalCorridor.notes.ilike(q_like)))
+    playbooks_q = db.query(WorkflowPlaybook).filter(or_(WorkflowPlaybook.playbook_name.ilike(q_like), WorkflowPlaybook.trigger_type.ilike(q_like), WorkflowPlaybook.assigned_unit_hint.ilike(q_like)))
+    video_sessions_q = db.query(VideoSession).filter(or_(VideoSession.room_name.ilike(q_like), VideoSession.session_code.ilike(q_like), VideoSession.notes.ilike(q_like)))
 
     if district:
         complaints_q = complaints_q.filter(Complaint.district == district)
@@ -1830,17 +2847,61 @@ def unified_search(
         checkpoints_q = checkpoints_q.filter(CheckpointPlan.district == district)
         geofences_q = geofences_q.filter(GeofenceZone.district == district)
         cameras_q = cameras_q.filter(CameraAsset.district == district)
+        connector_artifacts_q = connector_artifacts_q.filter(ConnectorArtifact.district == district)
+        provenance_q = provenance_q.filter(ProvenanceRecord.district == district)
+        corridors_q = corridors_q.filter(OperationalCorridor.district == district)
+        playbooks_q = playbooks_q.filter(WorkflowPlaybook.district == district)
+        video_sessions_q = video_sessions_q.filter(or_(VideoSession.district == district, VideoSession.district == None))
     if case_id:
         cases_q = cases_q.filter(Case.id == case_id)
         tasks_q = tasks_q.filter(or_(TaskQueue.case_id == case_id, TaskQueue.case_id == None))
         messages_q = messages_q.filter(or_(DepartmentMessage.case_id == case_id, DepartmentMessage.case_id == None))
         checkpoints_q = checkpoints_q.filter(or_(CheckpointPlan.case_id == case_id, CheckpointPlan.case_id == None))
+        connector_artifacts_q = connector_artifacts_q.filter(or_(ConnectorArtifact.case_id == case_id, ConnectorArtifact.case_id == None))
+        video_sessions_q = video_sessions_q.filter(or_(VideoSession.case_id == case_id, VideoSession.case_id == None))
 
     similarity_rows = similarity_hits(user=user, db=db)
     similarity_lookup = defaultdict(float)
     for row in similarity_rows:
         similarity_lookup[f"{row['source_type']}:{row['source_id']}"] = max(similarity_lookup[f"{row['source_type']}:{row['source_id']}"], float(row.get("similarity_score", 0.0)))
         similarity_lookup[f"{row['target_type']}:{row['target_id']}"] = max(similarity_lookup[f"{row['target_type']}:{row['target_id']}"], float(row.get("similarity_score", 0.0)))
+
+    entity_lookup = {row.id: row for row in db.query(Entity).all()}
+    fact_rows = []
+    for row in db.query(EntityAttributeFact).order_by(EntityAttributeFact.confidence.desc()).all():
+        entity = entity_lookup.get(row.entity_id)
+        searchable = " ".join(
+            [
+                row.attribute_name or "",
+                row.attribute_value or "",
+                row.source_name or "",
+                row.source_ref or "",
+                "" if entity is None else entity.display_name,
+            ]
+        ).lower()
+        if q.lower() not in searchable:
+            continue
+        if district and entity and entity.district != district:
+            continue
+        fact_rows.append((row, entity))
+
+    resolution_rows = []
+    for row in db.query(EntityResolutionCandidate).order_by(EntityResolutionCandidate.match_score.desc()).all():
+        left_entity = entity_lookup.get(row.left_entity_id)
+        right_entity = entity_lookup.get(row.right_entity_id)
+        searchable = " ".join(
+            [
+                row.rationale or "",
+                row.cluster_ref or "",
+                "" if left_entity is None else left_entity.display_name,
+                "" if right_entity is None else right_entity.display_name,
+            ]
+        ).lower()
+        if q.lower() not in searchable:
+            continue
+        if district and district not in {getattr(left_entity, "district", None), getattr(right_entity, "district", None)}:
+            continue
+        resolution_rows.append((row, left_entity, right_entity))
 
     def scored_record(record_type: str, record_id: int | None, district_value: str | None, label: str, base_score: float, payload: dict):
         similarity_bonus = similarity_lookup.get(f"{record_type}:{record_id}", 0.0)
@@ -1875,6 +2936,20 @@ def unified_search(
         top_hits.append(scored_record("geofence", row.id, row.district, row.zone_name, 0.39 + (0.18 if row.status == "active" else 0.0), {"geofence_type": row.geofence_type, "status": row.status, "notes": row.notes}))
     for row in cameras_q.limit(12).all():
         top_hits.append(scored_record("camera", row.id, row.district, row.camera_id, 0.38 + float(row.blind_spot_score or 0.0) / 25.0, {"camera_type": row.camera_type, "status": row.status, "zone_name": row.zone_name}))
+    for row in connector_artifacts_q.limit(12).all():
+        top_hits.append(scored_record("connector_artifact", row.id, row.district, f"{row.connector_name} | {row.external_ref}", 0.47, {"record_type": row.record_type, "status": row.status, "summary": row.ingest_summary}))
+    for row in provenance_q.limit(12).all():
+        top_hits.append(scored_record("provenance", row.id, row.district, f"{row.source_name} | {row.object_type}:{row.object_id}", 0.43 + float(row.confidence or 0.0) * 0.2, {"operation": row.operation, "source_ref": row.source_ref, "notes": row.notes}))
+    for row in corridors_q.limit(10).all():
+        top_hits.append(scored_record("corridor", row.id, row.district, row.corridor_name, 0.5 + float(row.risk_score or 0.0) * 0.2, {"corridor_type": row.corridor_type, "priority": row.surveillance_priority, "route_ref": row.route_ref}))
+    for row in playbooks_q.limit(10).all():
+        top_hits.append(scored_record("playbook", row.id, row.district, row.playbook_name, 0.54, {"trigger_type": row.trigger_type, "priority": row.default_priority, "assigned_unit_hint": row.assigned_unit_hint}))
+    for row in video_sessions_q.limit(10).all():
+        top_hits.append(scored_record("video_session", row.id, row.district, row.room_name, 0.41, {"session_code": row.session_code, "status": row.status, "session_mode": row.session_mode}))
+    for row, entity in fact_rows[:12]:
+        top_hits.append(scored_record("attribute_fact", row.id, None if entity is None else entity.district, f"{row.attribute_name}: {row.attribute_value}", 0.45 + float(row.confidence or 0.0) * 0.25, {"entity_name": None if entity is None else entity.display_name, "source_name": row.source_name, "source_ref": row.source_ref}))
+    for row, left_entity, right_entity in resolution_rows[:10]:
+        top_hits.append(scored_record("resolution_candidate", row.id, getattr(left_entity, "district", None), f"{getattr(left_entity, 'display_name', 'Left')} ↔ {getattr(right_entity, 'display_name', 'Right')}", 0.56 + float(row.match_score or 0.0) * 0.2, {"status": row.status, "cluster_ref": row.cluster_ref, "rationale": row.rationale}))
 
     top_hits = sorted(top_hits, key=lambda row: row["fusion_score"], reverse=True)[:25]
     return {
@@ -1892,6 +2967,13 @@ def unified_search(
             "checkpoints": checkpoints_q.count(),
             "geofences": geofences_q.count(),
             "cameras": cameras_q.count(),
+            "attribute_facts": len(fact_rows),
+            "resolution_candidates": len(resolution_rows),
+            "connector_artifacts": connector_artifacts_q.count(),
+            "provenance_records": provenance_q.count(),
+            "corridors": corridors_q.count(),
+            "playbooks": playbooks_q.count(),
+            "video_sessions": video_sessions_q.count(),
         },
     }
 

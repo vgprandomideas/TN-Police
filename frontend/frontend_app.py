@@ -1080,6 +1080,114 @@ def build_boundary_layer_svg(
     """
 
 
+def build_corridor_svg(
+    title: str,
+    subtitle: str,
+    district_rows: list[dict[str, Any]],
+    corridor_rows: list[dict[str, Any]],
+    selected_district: str | None = None,
+    link_getter: Callable[[dict[str, Any]], str | None] | None = None,
+) -> str:
+    width = 980
+    height = 760
+    padding = 70
+    if not district_rows:
+        return '<div class="tn-inline-note">Operational corridor data is not available for the current selection.</div>'
+
+    geo_points = list(TN_STATE_OUTLINE)
+    for row in district_rows:
+        geo_points.append((to_float(row.get("longitude")), to_float(row.get("latitude"))))
+    for row in corridor_rows:
+        for point in row.get("points") or []:
+            geo_points.append((to_float(point.get("longitude")), to_float(point.get("latitude"))))
+
+    min_lon = min(point[0] for point in geo_points)
+    max_lon = max(point[0] for point in geo_points)
+    min_lat = min(point[1] for point in geo_points)
+    max_lat = max(point[1] for point in geo_points)
+
+    outline_points = []
+    for lon, lat in TN_STATE_OUTLINE:
+        x, y = project_geo_point(lon, lat, min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        outline_points.append(f"{x:.1f},{y:.1f}")
+    outline_markup = " ".join(outline_points)
+
+    district_markup: list[str] = []
+    for row in district_rows:
+        label = str(row.get("district") or "Unknown")
+        x, y = project_geo_point(to_float(row.get("longitude")), to_float(row.get("latitude")), min_lon, max_lon, min_lat, max_lat, width, height, padding)
+        point_stroke = "#ffe2bf" if selected_district and label == selected_district else "#8cbcff"
+        point_body = (
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5.6" fill="rgba(118, 183, 255, 0.32)" stroke="{point_stroke}" stroke-width="1.4"></circle>'
+            f'<text x="{x:.1f}" y="{(y - 10):.1f}" text-anchor="middle" style="fill:#cfe3ff;font-size:10px;font-family:system-ui,sans-serif;">{escape(label)}</text>'
+        )
+        if link_getter:
+            point_url = link_getter(row)
+            if point_url:
+                point_body = f'<a href="{escape(point_url, quote=True)}" target="_top" style="text-decoration:none;">{point_body}</a>'
+        district_markup.append(f"<g>{point_body}</g>")
+
+    corridor_palette = {
+        "high": "#ff8c42",
+        "medium": "#76b7ff",
+        "low": "#9db0cc",
+    }
+    corridor_markup: list[str] = []
+    for row in corridor_rows:
+        points = []
+        for point in row.get("points") or []:
+            x, y = project_geo_point(
+                to_float(point.get("longitude")),
+                to_float(point.get("latitude")),
+                min_lon,
+                max_lon,
+                min_lat,
+                max_lat,
+                width,
+                height,
+                padding,
+            )
+            points.append((x, y, str(point.get("district") or "")))
+        if len(points) < 2:
+            continue
+        polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y, _district in points)
+        color = corridor_palette.get(str(row.get("surveillance_priority") or "medium").lower(), "#76b7ff")
+        width_scale = 2.2 + (to_float(row.get("risk_score")) * 0.8)
+        corridor_markup.append(
+            f"""
+            <g>
+                <polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="{width_scale:.1f}"
+                    stroke-linecap="round" stroke-linejoin="round" opacity="0.86">
+                    <title>{escape(str(row.get("corridor_name") or "Corridor"))} | Risk: {row.get("risk_score")} | Priority: {row.get("surveillance_priority")}</title>
+                </polyline>
+                {''.join(
+                    f'<circle cx="{x:.1f}" cy="{y:.1f}" r="6.2" fill="{color}" stroke="#f8fbff" stroke-width="1.2"></circle>'
+                    for x, y, _district in points
+                )}
+            </g>
+            """
+        )
+
+    return f"""
+    <div style="border:1px solid rgba(92,116,151,0.35);border-radius:24px;padding:1rem 1rem 0.7rem 1rem;
+        background:linear-gradient(180deg, rgba(15,25,40,0.98), rgba(10,18,28,0.96));">
+        <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:1rem;flex-wrap:wrap;">
+            <div>
+                <div style="color:#76b7ff;font-size:0.82rem;letter-spacing:0.12em;text-transform:uppercase;font-weight:700;">{escape(title)}</div>
+                <div style="color:#97a8c4;font-size:0.95rem;margin-top:0.25rem;">{escape(subtitle)}</div>
+            </div>
+            <div style="color:#97a8c4;font-size:0.82rem;">Orange corridors are high-priority. Blue corridors are active surveillance lanes.</div>
+        </div>
+        <svg viewBox="0 0 {width} {height}" style="width:100%;height:auto;margin-top:0.8rem;">
+            <polygon points="{outline_markup}" fill="rgba(118,183,255,0.04)"
+                stroke="rgba(118,183,255,0.35)" stroke-width="3" />
+            {"".join(corridor_markup)}
+            {"".join(district_markup)}
+        </svg>
+    </div>
+    """
+
+
 def maybe_send_presence_heartbeat(room_name: str, district_scope: str, status_label: str = "active") -> None:
     now = time.time()
     last_ping = float(st.session_state.get("presence_last_ping_ts", 0.0))
@@ -1137,6 +1245,52 @@ def maybe_send_typing_heartbeat(room_name: str, district_scope: str, case_id: in
         if result.get("ok"):
             st.session_state.typing_active = False
             st.session_state.typing_last_room = room_name
+
+
+def maybe_send_video_participant_heartbeat(
+    session_code: str,
+    *,
+    device_label: str,
+    join_state: str,
+    hand_raised: bool,
+    muted: bool,
+    camera_enabled: bool,
+    screen_sharing: bool,
+) -> None:
+    if not session_code:
+        return
+    now = time.time()
+    state_signature = json.dumps(
+        {
+            "device_label": device_label,
+            "join_state": join_state,
+            "hand_raised": hand_raised,
+            "muted": muted,
+            "camera_enabled": camera_enabled,
+            "screen_sharing": screen_sharing,
+        },
+        sort_keys=True,
+    )
+    last_ping = float(st.session_state.get("video_presence_last_ping_ts", 0.0))
+    last_session = str(st.session_state.get("video_presence_last_session", ""))
+    last_signature = str(st.session_state.get("video_presence_signature", ""))
+    if (now - last_ping) < 20 and last_session == session_code and last_signature == state_signature:
+        return
+    result = api_post(
+        f"/video/sessions/{session_code}/participant-state",
+        payload={
+            "device_label": device_label,
+            "join_state": join_state,
+            "hand_raised": hand_raised,
+            "muted": muted,
+            "camera_enabled": camera_enabled,
+            "screen_sharing": screen_sharing,
+        },
+    )
+    if result.get("ok"):
+        st.session_state.video_presence_last_ping_ts = now
+        st.session_state.video_presence_last_session = session_code
+        st.session_state.video_presence_signature = state_signature
 
 
 def websocket_api_url() -> str:
@@ -1202,6 +1356,59 @@ def render_war_room_socket_panel(room_name: str, district_scope: str) -> None:
     )
 
 
+def render_video_signal_panel(session_code: str) -> None:
+    token = str(st.session_state.get("token") or "")
+    if not token or not session_code:
+        return
+    ws_url = f"{websocket_api_url()}/video/sessions/{quote(session_code)}/ws?token={token}"
+    components.html(
+        f"""
+        <div style="border:1px solid rgba(92,116,151,0.35);border-radius:18px;padding:0.85rem 1rem;background:rgba(10,18,28,0.92);font-family:system-ui,sans-serif;color:#eaf2ff;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:0.8rem;">
+                <div style="font-weight:700;">Video Signal Bus</div>
+                <div id="tn-video-ws-status" style="font-size:0.8rem;color:#97a8c4;">Connecting...</div>
+            </div>
+            <div style="font-size:0.82rem;color:#97a8c4;margin-top:0.35rem;">Session signaling for {escape(session_code)}.</div>
+            <div id="tn-video-ws-events" style="margin-top:0.8rem;display:flex;flex-direction:column;gap:0.55rem;max-height:220px;overflow:auto;"></div>
+        </div>
+        <script>
+        const statusEl = document.getElementById("tn-video-ws-status");
+        const eventsEl = document.getElementById("tn-video-ws-events");
+        const ws = new WebSocket("{escape(ws_url, quote=True)}");
+        const renderEvent = (payload) => {{
+            const card = document.createElement("div");
+            card.style.border = "1px solid rgba(92,116,151,0.35)";
+            card.style.borderRadius = "12px";
+            card.style.padding = "0.55rem 0.7rem";
+            card.style.background = "rgba(17,26,39,0.92)";
+            const title = payload.event_type === "participant_state"
+                ? `${{payload.username || "participant"}} state sync`
+                : payload.event_type === "signal"
+                    ? `${{payload.username || "participant"}} signaling`
+                    : payload.event_type;
+            card.innerHTML = `<div style="font-size:0.78rem;color:#76b7ff;font-weight:700;">${{title}}</div><div style="font-size:0.8rem;margin-top:0.2rem;">${{payload.join_state || payload.payload || payload.room_name || ""}}</div>`;
+            eventsEl.prepend(card);
+            while (eventsEl.children.length > 8) {{
+                eventsEl.removeChild(eventsEl.lastChild);
+            }}
+        }};
+        ws.onopen = () => {{ statusEl.textContent = "Connected"; statusEl.style.color = "#47d89a"; }};
+        ws.onmessage = (event) => {{
+            try {{
+                renderEvent(JSON.parse(event.data));
+            }} catch (error) {{
+                renderEvent({{ event_type: "signal", payload: "Video signal received." }});
+            }}
+        }};
+        ws.onerror = () => {{ statusEl.textContent = "Signal degraded"; statusEl.style.color = "#ff8c42"; }};
+        ws.onclose = () => {{ statusEl.textContent = "Disconnected"; statusEl.style.color = "#ff8c42"; }};
+        </script>
+        """,
+        height=330,
+        scrolling=False,
+    )
+
+
 def sanitize_room_slug(value: str) -> str:
     slug = "".join(character.lower() if character.isalnum() else "-" for character in str(value or ""))
     while "--" in slug:
@@ -1219,24 +1426,62 @@ def render_video_briefing_panel(
     district_slug = sanitize_room_slug("statewide" if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope)
     room_slug = sanitize_room_slug(room_name)
     case_slug = f"case-{selected_case_id}" if selected_case_id is not None else "general-ops"
-    meeting_room_code = f"tn-police-{district_slug}-{room_slug}-{case_slug}"
-    meeting_url = f"https://meet.jit.si/{meeting_room_code}"
-    meeting_url_with_name = (
-        meeting_url
+    fallback_room_code = f"tn-police-{district_slug}-{room_slug}-{case_slug}"
+    fallback_meeting_url = (
+        f"https://meet.jit.si/{fallback_room_code}"
         + f"#userInfo.displayName=\"{quote(str(me_payload.get('username') or st.session_state.get('username') or 'Analyst'))}\""
         + "&config.prejoinPageEnabled=false"
     )
-    online_personnel = [
-        row for row in presence_rows
-        if str(row.get("is_online")).lower() == "yes"
-    ]
+    district_param = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
+    session_rows = raw_rows_from_result(
+        api_get(
+            "/video/sessions",
+            params=compact_params(
+                {
+                    "district": district_param,
+                    "room_name": room_name,
+                    "case_id": selected_case_id,
+                }
+            ) or None,
+        )
+    )
+    online_personnel = [row for row in presence_rows if str(row.get("is_online")).lower() == "yes"]
+
+    session_option_map = {
+        f"{row.get('room_name')} | {row.get('session_mode')} | {row.get('status')}": row
+        for row in session_rows
+        if row.get("session_code")
+    }
+    query_session_code = get_query_param("ops_video")
+    selected_session = next((row for row in session_rows if str(row.get("session_code")) == str(query_session_code)), session_rows[0] if session_rows else {})
+    if session_option_map:
+        reverse_map = {str(value.get("session_code")): key for key, value in session_option_map.items()}
+        default_label = reverse_map.get(str(selected_session.get("session_code"))) or next(iter(session_option_map))
+        selected_session_label = st.selectbox(
+            "Video session",
+            list(session_option_map.keys()),
+            index=list(session_option_map.keys()).index(default_label),
+            key="video_session_select",
+        )
+        selected_session = session_option_map[selected_session_label]
+        set_query_param("ops_video", selected_session.get("session_code"))
+
+    active_session_code = str(selected_session.get("session_code") or fallback_room_code)
+    meeting_room_code = active_session_code
+    meeting_url_with_name = str(selected_session.get("join_url") or fallback_meeting_url)
+    participant_rows = raw_rows_from_result(api_get(f"/video/sessions/{active_session_code}/participants")) if selected_session else []
+
     render_metric_grid(
         [
-            ("Meeting Room", meeting_room_code),
+            ("Video Sessions", len(session_rows)),
+            ("Active Participants", len(participant_rows)),
             ("Eligible Personnel", len(online_personnel)),
+            ("Raised Hands", sum(1 for row in participant_rows if row.get("hand_raised"))),
+            ("Screen Shares", sum(1 for row in participant_rows if row.get("screen_sharing"))),
             ("District Scope", district_scope),
         ]
     )
+
     bridge_left, bridge_right = st.columns([1.2, 0.8])
     with bridge_left:
         components.html(
@@ -1244,8 +1489,8 @@ def render_video_briefing_panel(
             <div style="border:1px solid rgba(92,116,151,0.35);border-radius:24px;overflow:hidden;background:linear-gradient(180deg, rgba(15,25,40,0.98), rgba(10,18,28,0.96));">
                 <div style="padding:1rem 1rem 0.8rem 1rem;display:flex;justify-content:space-between;align-items:flex-end;gap:1rem;flex-wrap:wrap;">
                     <div>
-                        <div style="color:#76b7ff;font-size:0.82rem;letter-spacing:0.12em;text-transform:uppercase;font-weight:700;">Video Briefing Bridge</div>
-                        <div style="color:#97a8c4;font-size:0.95rem;margin-top:0.25rem;">Secure live briefing room aligned to the active war-room thread.</div>
+                        <div style="color:#76b7ff;font-size:0.82rem;letter-spacing:0.12em;text-transform:uppercase;font-weight:700;">Video Command Plane</div>
+                        <div style="color:#97a8c4;font-size:0.95rem;margin-top:0.25rem;">Session registry, participant state, signaling bus, and live briefing bridge aligned to the active war-room thread.</div>
                     </div>
                     <div style="color:#97a8c4;font-size:0.82rem;">Camera, microphone, fullscreen, and screen sharing enabled.</div>
                 </div>
@@ -1261,11 +1506,74 @@ def render_video_briefing_panel(
             scrolling=False,
         )
     with bridge_right:
+        session_mode = st.selectbox("Session mode", ["webrtc_mesh", "sfu_ready", "command_bridge"], index=1, key="video_session_mode")
+        session_notes = st.text_area(
+            "Session notes",
+            height=90,
+            key="video_session_notes",
+            placeholder="Command briefing, evidence review, cross-district escalation, or corridor intercept coordination.",
+        )
+        if st.button("Create or Join Department Session", use_container_width=True, key="video_create_join"):
+            run_action_and_refresh(
+                "/video/sessions",
+                payload={
+                    "room_name": room_name,
+                    "district": district_param,
+                    "case_id": selected_case_id,
+                    "session_mode": session_mode,
+                    "notes": session_notes or None,
+                },
+                success_message="Video session is ready.",
+            )
         st.link_button("Open Video Conference in New Tab", meeting_url_with_name, use_container_width=True)
         st.code(meeting_room_code)
         render_inline_note(
-            "Use the same room code across the department to join the live briefing bridge for this war-room thread. The embedded panel supports camera, microphone, and screen sharing."
+            "The department video layer now uses an app-native control plane: session registry, participant heartbeat, live signaling bus, and room-aligned meeting bridge."
         )
+        render_table(
+            "Session Registry",
+            session_rows,
+            caption="Visible briefing sessions for the current war-room and district lens.",
+            limit=10,
+        )
+
+        if selected_session:
+            device_label = st.text_input("Device label", value="Browser console", key=f"video_device_{active_session_code}")
+            join_state = st.selectbox("Join state", ["connected", "monitoring", "reconnecting", "observer"], index=0, key=f"video_join_state_{active_session_code}")
+            hand_raised = st.checkbox("Hand raised", value=False, key=f"video_hand_raised_{active_session_code}")
+            muted = st.checkbox("Muted", value=False, key=f"video_muted_{active_session_code}")
+            camera_enabled = st.checkbox("Camera enabled", value=True, key=f"video_camera_enabled_{active_session_code}")
+            screen_sharing = st.checkbox("Screen sharing", value=False, key=f"video_screen_sharing_{active_session_code}")
+            maybe_send_video_participant_heartbeat(
+                active_session_code,
+                device_label=device_label,
+                join_state=join_state,
+                hand_raised=hand_raised,
+                muted=muted,
+                camera_enabled=camera_enabled,
+                screen_sharing=screen_sharing,
+            )
+            if st.button("Sync participant state", use_container_width=True, key=f"video_sync_{active_session_code}"):
+                run_action_and_refresh(
+                    f"/video/sessions/{active_session_code}/participant-state",
+                    payload={
+                        "device_label": device_label,
+                        "join_state": join_state,
+                        "hand_raised": hand_raised,
+                        "muted": muted,
+                        "camera_enabled": camera_enabled,
+                        "screen_sharing": screen_sharing,
+                    },
+                    success_message="Video participant state synchronized.",
+                )
+            render_table(
+                "Participant Board",
+                participant_rows,
+                caption="Current participant posture, device state, mute/camera flags, and live control status.",
+                limit=16,
+            )
+            render_video_signal_panel(active_session_code)
+
         render_table(
             "Suggested Participants",
             online_personnel,
@@ -2614,6 +2922,10 @@ def render_geo_command(district_scope: str) -> None:
         row for row in route_rows
         if not detail_district or detail_district in set(str(item) for item in row.get("districts", []))
     ] or build_route_rows(district_map_rows, movement_flow_rows[:12], suspect_rows, scoped_case_rows)
+    statewide_corridor_rows = raw_rows_from_result(api_get("/geo/corridors"))
+    corridor_rows = raw_rows_from_result(
+        api_get("/geo/corridors", params=compact_params({"district": detail_district}) or None)
+    ) or statewide_corridor_rows
     route_option_map = {f"{row.get('subject_label')} | {row.get('route_type')}": str(row.get("route_id")) for row in route_rows}
     query_route = get_query_param("ops_route")
     if query_route and route_rows and st.session_state.get("geo_route_id") != query_route:
@@ -2650,6 +2962,7 @@ def render_geo_command(district_scope: str) -> None:
         [
             ("Districts Mapped", len(district_map_rows)),
             ("Movement Flows", len(movement_flow_rows)),
+            ("Operational Corridors", len(statewide_corridor_rows)),
             ("Tracked Routes", len(route_rows)),
             ("Police Station Circles", len(statewide_circle_rows)),
             ("District Incidents", total_incidents),
@@ -2668,7 +2981,7 @@ def render_geo_command(district_scope: str) -> None:
         ]
     )
 
-    tabs = st.tabs(["Situation", "Movement Flows", "CCTV Ops", "Police Circles", "Routes", "GIS and Checkpoints", "Timeline Playback"])
+    tabs = st.tabs(["Situation", "Movement Flows", "Corridors", "CCTV Ops", "Police Circles", "Routes", "GIS and Checkpoints", "Timeline Playback"])
     with tabs[0]:
         map_left, map_right = st.columns([1.18, 0.82])
         with map_left:
@@ -2781,6 +3094,40 @@ def render_geo_command(district_scope: str) -> None:
 
     with tabs[2]:
         render_inline_note(
+            "Operational corridors blend route intelligence, surveillance priority, and district sequencing. Use them to place checkpoints, corridor cameras, and patrol saturation against repeated movement lanes."
+        )
+        corridor_left, corridor_right = st.columns([1.16, 0.84])
+        with corridor_left:
+            render_geo_html(
+                build_corridor_svg(
+                    "Operational Corridor Overlay",
+                    "Corridors are seeded from operational route intelligence and connector-backed movement hypotheses.",
+                    selected_district_map_rows,
+                    corridor_rows,
+                    selected_district=detail_district,
+                    link_getter=district_link_getter,
+                ),
+                height=920,
+            )
+        with corridor_right:
+            render_table(
+                "Corridor Registry",
+                corridor_rows,
+                caption="Visible corridor layers with route reference, risk score, and surveillance priority.",
+                limit=18,
+            )
+            render_table(
+                "Checkpoint Coupling",
+                [
+                    row for row in statewide_checkpoint_rows
+                    if not corridor_rows or str(row.get("route_ref")) in {str(corridor.get("route_ref")) for corridor in corridor_rows}
+                ],
+                caption="Checkpoint plans currently coupled to corridor-linked route references.",
+                limit=14,
+            )
+
+    with tabs[3]:
+        render_inline_note(
             "CCTV planning and blind-spot heatmaps are derived from district intensity, anomaly load, hotspot forecasts, patrol gaps, and geofence activity. These are deployment recommendations rather than claims of live camera access."
         )
         cctv_left, cctv_right = st.columns([1.14, 0.86])
@@ -2846,7 +3193,7 @@ def render_geo_command(district_scope: str) -> None:
                 limit=20,
             )
 
-    with tabs[3]:
+    with tabs[4]:
         render_inline_note(
             "Coverage circles represent lookout and response radii around police stations. They are operational watch zones, not exact legal jurisdiction boundaries."
         )
@@ -2902,7 +3249,7 @@ def render_geo_command(district_scope: str) -> None:
                 limit=20,
             )
 
-    with tabs[4]:
+    with tabs[5]:
         render_inline_note(
             "Tracked routes combine district-to-district linkage pressure, suspect threat posture, and high-priority case corridors. Use the selected route overlay to inspect likely movement chains."
         )
@@ -2952,7 +3299,7 @@ def render_geo_command(district_scope: str) -> None:
                     limit=10,
                 )
 
-    with tabs[5]:
+    with tabs[6]:
         render_inline_note(
             "Boundary layers now stack district, station, and patrol-sector geometry with editable geofences and checkpoint planning. These remain operational planning layers rather than legal cadastral maps."
         )
@@ -3049,7 +3396,7 @@ def render_geo_command(district_scope: str) -> None:
                             success_message="Geofence zone created.",
                         )
 
-    with tabs[6]:
+    with tabs[7]:
         render_inline_note(
             "Timeline playback reconstructs filtered incidents in chronological order. Slide through the sequence to see how the incident picture escalates across the selected district."
         )
@@ -3101,6 +3448,7 @@ def render_geo_command(district_scope: str) -> None:
 
 
 def render_graph_fabric(district_scope: str, selected_case_id: int | None) -> None:
+    district_param = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
     entity_rows = rows_from_result(api_get("/graph/entities"))
     link_rows = rows_from_result(api_get("/graph/links"))
     if district_scope != DEFAULT_DISTRICT_SCOPE:
@@ -3149,7 +3497,7 @@ def render_graph_fabric(district_scope: str, selected_case_id: int | None) -> No
             "/graph/saved-views",
             params=compact_params(
                 {
-                    "district": None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope,
+                    "district": district_param,
                     "case_id": selected_case_id,
                 }
             ) or None,
@@ -3157,16 +3505,28 @@ def render_graph_fabric(district_scope: str, selected_case_id: int | None) -> No
     )
     node_link_getter = lambda row: build_query_url({"ops_node": row.get("id")})
     selected_node = payload.get("selected_node") or {}
+    selected_entity_id = None
+    if str(selected_node_id or "").startswith("entity-"):
+        selected_entity_id = to_optional_int(str(selected_node_id).split("-", 1)[1])
+    profile_result = api_get(f"/ontology/entities/{selected_entity_id}/profile") if selected_entity_id is not None else {"ok": False, "data": {}}
+    profile_payload = profile_result.get("data") if profile_result.get("ok") and isinstance(profile_result.get("data"), dict) else {}
+    ontology_class_rows = rows_from_result(api_get("/ontology/classes"))
+    relationship_rows = rows_from_result(api_get("/ontology/relationship-types"))
+    resolution_rows = rows_from_result(api_get("/entity-resolution/candidates", params=compact_params({"district": district_param, "entity_id": selected_entity_id}) or None))
+    decision_rows = rows_from_result(api_get("/entity-resolution/decisions", params=compact_params({"district": district_param}) or None))
+    provenance_rows = rows_from_result(api_get("/provenance/records", params=compact_params({"district": district_param, "entity_id": selected_entity_id, "case_id": selected_case_id}) or None))
+    attribute_rows = payload_to_rows(profile_payload.get("attributes"))
 
     render_hero(
         "Graph Fabric",
-        "Interactive graph intelligence for entities, cases, evidence, and linked relationships across the active operational scope.",
+        "Interactive graph intelligence for entities, cases, evidence, linked relationships, ontology facts, entity resolution, and provenance across the active operational scope.",
         eyebrow="Entity Graph Intelligence",
         chips=[
             f"District scope: {district_scope}",
             f"Case focus: {selected_case_id if selected_case_id is not None else 'none'}",
             f"Nodes: {len(payload.get('nodes', []))}",
             f"Edges: {len(payload.get('edges', []))}",
+            f"Resolution candidates: {len(resolution_rows)}",
         ],
     )
     render_metric_grid(
@@ -3177,10 +3537,12 @@ def render_graph_fabric(district_scope: str, selected_case_id: int | None) -> No
             ("Selected Type", selected_node.get("type", "N/A")),
             ("Selected District", selected_node.get("district", "N/A")),
             ("Risk Score", selected_node.get("risk_score", "N/A")),
+            ("Attribute Facts", len(attribute_rows)),
+            ("Provenance Rows", len(provenance_rows)),
         ]
     )
 
-    tabs = st.tabs(["Canvas", "Expand", "Trace and Compare", "Saved Views"])
+    tabs = st.tabs(["Canvas", "Expand", "Trace and Compare", "Ontology Lens", "Saved Views"])
     with tabs[0]:
         graph_left, graph_right = st.columns([1.2, 0.8])
         with graph_left:
@@ -3361,6 +3723,88 @@ def render_graph_fabric(district_scope: str, selected_case_id: int | None) -> No
                     render_result_error(compare_result, "Graph Compare")
 
     with tabs[3]:
+        ontology_left, ontology_right = st.columns([1.05, 0.95])
+        with ontology_left:
+            render_table(
+                "Ontology Classes",
+                ontology_class_rows,
+                caption="Core ontology classes available to the graph workbench.",
+                limit=16,
+            )
+            render_table(
+                "Relationship Types",
+                relationship_rows,
+                caption="Declared ontology relationship types and confidence bands.",
+                limit=18,
+            )
+            render_table(
+                "Attribute Facts",
+                attribute_rows,
+                caption="Observed attribute facts for the focused entity node.",
+                limit=18,
+            )
+        with ontology_right:
+            render_table(
+                "Entity Profile",
+                payload_to_rows(profile_payload.get("entity")),
+                caption="Focused entity profile sourced from the ontology workbench.",
+                limit=1,
+            )
+            render_table(
+                "Connector Artifacts",
+                payload_to_rows(profile_payload.get("connector_artifacts")),
+                caption="Connector artifacts linked to the focused entity.",
+                limit=12,
+            )
+            render_table(
+                "Provenance Trail",
+                payload_to_rows(profile_payload.get("provenance")) or provenance_rows,
+                caption="Source lineage and operational provenance for the selected entity or case lens.",
+                limit=14,
+            )
+
+        resolution_left, resolution_right = st.columns([1.04, 0.96])
+        with resolution_left:
+            render_table(
+                "Resolution Candidates",
+                payload_to_rows(profile_payload.get("resolution_candidates")) or resolution_rows,
+                caption="Entity-resolution candidates connected to the focused entity or current district scope.",
+                limit=16,
+            )
+            render_table(
+                "Resolution Decisions",
+                payload_to_rows(profile_payload.get("resolution_decisions")) or decision_rows,
+                caption="Analyst decisions previously recorded against candidate merges or reviews.",
+                limit=12,
+            )
+        with resolution_right:
+            candidate_rows = payload_to_rows(profile_payload.get("resolution_candidates")) or raw_rows_from_result(
+                api_get("/entity-resolution/candidates", params=compact_params({"district": district_param, "entity_id": selected_entity_id}) or None)
+            )
+            candidate_option_map = {
+                f"{row.get('left_entity_name')} ↔ {row.get('right_entity_name')} | {row.get('status')} | {row.get('match_score')}": to_int(row.get("id"))
+                for row in candidate_rows
+                if row.get("id") not in (None, "N/A")
+            }
+            if candidate_option_map:
+                with st.form("entity_resolution_action_form"):
+                    selected_candidate_label = st.selectbox("Resolution candidate", list(candidate_option_map.keys()))
+                    decision_status = st.selectbox("Decision", ["accepted", "review", "rejected"], index=0)
+                    decision_notes = st.text_area("Decision notes", height=110)
+                    if st.form_submit_button("Record resolution decision", use_container_width=True):
+                        run_action_and_refresh(
+                            "/entity-resolution/resolve",
+                            payload={
+                                "candidate_id": candidate_option_map[selected_candidate_label],
+                                "decision_status": decision_status,
+                                "notes": decision_notes or None,
+                            },
+                            success_message="Resolution decision recorded.",
+                        )
+            else:
+                render_inline_note("Resolution actions appear once a focused entity with ontology profile and duplicate candidate context is selected.")
+
+    with tabs[4]:
         view_left, view_right = st.columns([1.0, 1.0])
         with view_left:
             render_table(
@@ -3404,6 +3848,7 @@ def render_war_room(
     district_param = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
     room_rows = rows_from_result(api_get("/internal-comms/rooms", params=compact_params({"district": district_param}) or None))
     presence_rows = rows_from_result(api_get("/personnel/presence", params=compact_params({"district": district_param}) or None))
+    video_session_rows = rows_from_result(api_get("/video/sessions", params=compact_params({"district": district_param}) or None))
     snapshot_rows = rows_from_result(api_get("/war-room-snapshots", params=compact_params({"district": district_param}) or None))
     checkpoint_rows = rows_from_result(api_get("/checkpoint-plans", params=compact_params({"district": district_param}) or None))
     district_rows = build_district_map_rows(rows_from_result(api_get("/geo/district-heatmap")))
@@ -3456,6 +3901,7 @@ def render_war_room(
             f"Thread: {selected_room}",
             f"Live updates: {'on' if live_updates else 'off'}",
             f"Unread rooms: {unread_total}",
+            f"Video sessions: {len(video_session_rows)}",
         ],
     )
     render_metric_grid(
@@ -3467,6 +3913,7 @@ def render_war_room(
             ("Checkpoint Plans", len(checkpoint_rows)),
             ("Active Checkpoints", active_checkpoints),
             ("War-Room Snapshots", len(snapshot_rows)),
+            ("Video Sessions", len(video_session_rows)),
         ]
     )
 
@@ -4720,10 +5167,140 @@ def render_camera_command(district_scope: str, selected_case_id: int | None) -> 
                     run_action_and_refresh("/camera/assignments", payload=payload, success_message="Camera assignment created.")
 
 
+def render_connector_ops(district_scope: str, selected_case_id: int | None) -> None:
+    district_param = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
+    connector_rows = rows_from_result(api_get("/connectors"))
+    adapter_rows = rows_from_result(api_get("/adapter-stubs"))
+    run_rows = rows_from_result(api_get("/connectors/runs"))
+    artifact_rows = rows_from_result(
+        api_get(
+            "/connectors/artifacts",
+            params=compact_params({"district": district_param, "case_id": selected_case_id}) or None,
+        )
+    )
+    ingest_rows = rows_from_result(api_get("/ingest-queue"))
+    running_rows = [row for row in run_rows if str(row.get("status")).lower() == "running"]
+    completed_rows = [row for row in run_rows if str(row.get("status")).lower() == "completed"]
+
+    render_hero(
+        "Connector Ops",
+        "Operational data connectors, sanctioned source registry, run history, artifact ledger, and trigger controls for the ingestion fabric.",
+        eyebrow="Operational Data Connectors",
+        chips=[
+            f"District scope: {district_scope}",
+            f"Case focus: {selected_case_id if selected_case_id is not None else 'none'}",
+            f"Connectors: {len(connector_rows)}",
+            f"Artifacts: {len(artifact_rows)}",
+        ],
+    )
+    render_metric_grid(
+        [
+            ("Sanctioned Connectors", len(connector_rows)),
+            ("Adapter Stubs", len(adapter_rows)),
+            ("Connector Runs", len(run_rows)),
+            ("Running Runs", len(running_rows)),
+            ("Completed Runs", len(completed_rows)),
+            ("Artifacts", len(artifact_rows)),
+            ("Ingest Queue", len(ingest_rows)),
+        ]
+    )
+
+    tabs = st.tabs(["Registry", "Run History", "Artifact Ledger", "Trigger Connector"])
+    with tabs[0]:
+        registry_left, registry_right = st.columns([1.02, 0.98])
+        with registry_left:
+            render_table(
+                "Sanctioned Connector Registry",
+                connector_rows,
+                caption="Declared operational connector registry, sanctioned status, access mode, and source type.",
+                limit=16,
+            )
+        with registry_right:
+            render_table(
+                "Adapter Stubs",
+                adapter_rows,
+                caption="Adapter scaffolds and sanctioned bridge stubs available to the connector fabric.",
+                limit=16,
+            )
+            render_table(
+                "Recent Ingest Queue",
+                ingest_rows,
+                caption="Observed ingest queue items across connector-triggered and seeded flows.",
+                limit=16,
+            )
+
+    with tabs[1]:
+        run_left, run_right = st.columns([1.0, 1.0])
+        with run_left:
+            render_table(
+                "Connector Run History",
+                run_rows,
+                caption="Connector run timeline with status, latency, and emitted record counts.",
+                limit=20,
+            )
+        with run_right:
+            render_table(
+                "Running Connectors",
+                running_rows,
+                caption="Runs currently marked active or streaming.",
+                limit=10,
+            )
+            render_table(
+                "Completed Connectors",
+                completed_rows,
+                caption="Most recent completed connector runs.",
+                limit=10,
+            )
+
+    with tabs[2]:
+        artifact_left, artifact_right = st.columns([1.06, 0.94])
+        with artifact_left:
+            render_table(
+                "Connector Artifact Ledger",
+                artifact_rows,
+                caption="Artifacts emitted by operational connectors into the investigation fabric.",
+                limit=24,
+            )
+        with artifact_right:
+            connector_names = sorted({str(row.get("connector_name")) for row in artifact_rows if row.get("connector_name")})
+            selected_connector_name = st.selectbox("Connector lens", ["All"] + connector_names, key="connector_ops_artifact_lens")
+            filtered_rows = artifact_rows if selected_connector_name == "All" else [
+                row for row in artifact_rows if str(row.get("connector_name")) == selected_connector_name
+            ]
+            render_table(
+                "Filtered Artifacts",
+                filtered_rows,
+                caption="Connector artifacts scoped by connector lens.",
+                limit=18,
+            )
+
+    with tabs[3]:
+        connector_option_map = {
+            str(row.get("connector_name")): row
+            for row in connector_rows
+            if row.get("connector_name")
+        }
+        with st.form("connector_trigger_form"):
+            selected_connector = st.selectbox("Connector", list(connector_option_map.keys()) or ["tn_cctns_citizen_portal"])
+            run_mode = st.selectbox("Run mode", ["poll", "stream", "manual_refresh"], index=0)
+            trigger_notes = st.text_area("Trigger notes", height=110)
+            if st.form_submit_button("Trigger connector run", use_container_width=True):
+                run_action_and_refresh(
+                    "/connectors/runs/trigger",
+                    payload={
+                        "connector_name": selected_connector,
+                        "run_mode": run_mode,
+                        "notes": trigger_notes or None,
+                    },
+                    success_message="Connector run triggered and artifacts emitted.",
+                )
+
+
 def render_dispatch_engine(district_scope: str, selected_case_id: int | None, me_payload: dict[str, Any]) -> None:
     district_param = None if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope
     task_rows = rows_from_result(api_get("/tasks", params=compact_params({"district": district_param, "case_id": selected_case_id}) or None))
     checkpoint_rows = rows_from_result(api_get("/checkpoint-plans", params=compact_params({"district": district_param, "case_id": selected_case_id}) or None))
+    playbook_rows = rows_from_result(api_get("/workflow/playbooks", params=compact_params({"district": district_param}) or None))
     case_rows = rows_from_result(api_get("/cases"))
     district_rows = build_district_map_rows(rows_from_result(api_get("/geo/district-heatmap")))
     cluster_rows = rows_from_result(api_get("/fusion/clusters"))
@@ -4744,6 +5321,7 @@ def render_dispatch_engine(district_scope: str, selected_case_id: int | None, me
             f"Case focus: {selected_case_id if selected_case_id is not None else 'none'}",
             f"Tasks: {len(task_rows)}",
             f"Checkpoints: {len(checkpoint_rows)}",
+            f"Playbooks: {len(playbook_rows)}",
         ],
     )
     render_metric_grid(
@@ -4753,10 +5331,11 @@ def render_dispatch_engine(district_scope: str, selected_case_id: int | None, me
             ("Active", len(active_tasks)),
             ("Completed", len(completed_tasks)),
             ("Checkpoint Actions", len(checkpoint_rows)),
+            ("Workflow Playbooks", len(playbook_rows)),
         ]
     )
 
-    tabs = st.tabs(["Workflow Board", "Assignments and Approvals", "Closure Timeline"])
+    tabs = st.tabs(["Workflow Board", "Playbooks", "Assignments and Approvals", "Closure Timeline"])
     with tabs[0]:
         board_left, board_right = st.columns([1.0, 1.0])
         with board_left:
@@ -4791,6 +5370,41 @@ def render_dispatch_engine(district_scope: str, selected_case_id: int | None, me
                     run_action_and_refresh("/tasks", payload=payload, success_message="Workflow task created.")
 
     with tabs[1]:
+        playbook_left, playbook_right = st.columns([1.04, 0.96])
+        with playbook_left:
+            render_table(
+                "Workflow Playbooks",
+                playbook_rows,
+                caption="District-aligned operational playbooks with trigger type, priority, and action templates.",
+                limit=16,
+            )
+        with playbook_right:
+            playbook_option_map = {
+                f"{row.get('playbook_name')} | {row.get('district')} | {row.get('trigger_type')}": to_int(row.get("id"))
+                for row in playbook_rows
+                if row.get("id") not in (None, "N/A")
+            }
+            if playbook_option_map:
+                with st.form("workflow_playbook_launch_form"):
+                    selected_playbook_label = st.selectbox("Playbook", list(playbook_option_map.keys()))
+                    launch_district = st.text_input("Launch district", value="" if district_scope == DEFAULT_DISTRICT_SCOPE else district_scope)
+                    launch_unit = st.text_input("Assigned unit", value=str(me_payload.get("district") or "State Command Cell"))
+                    launch_notes = st.text_area("Launch notes", height=110)
+                    if st.form_submit_button("Launch workflow playbook", use_container_width=True):
+                        run_action_and_refresh(
+                            f"/workflow/playbooks/{playbook_option_map[selected_playbook_label]}/launch",
+                            payload={
+                                "district": launch_district,
+                                "assigned_unit": launch_unit or None,
+                                "case_id": selected_case_id,
+                                "notes": launch_notes or None,
+                            },
+                            success_message="Workflow playbook launched.",
+                        )
+            else:
+                render_inline_note("No playbooks are visible for the current district scope.")
+
+    with tabs[2]:
         task_option_map = {
             f"Task {row.get('id')} | {row.get('task_type')} | {row.get('status')}": to_int(row.get("id"))
             for row in task_rows
@@ -4820,7 +5434,7 @@ def render_dispatch_engine(district_scope: str, selected_case_id: int | None, me
                     }
                     run_action_and_refresh(f"/tasks/{selected_task_id}/actions", payload=payload, success_message="Task action recorded.")
 
-    with tabs[2]:
+    with tabs[3]:
         closure_left, closure_right = st.columns([1.0, 1.0])
         with closure_left:
             render_table("Completed Tasks", completed_tasks, caption="Workflow tasks that reached closure or completion.", limit=18)
@@ -4958,6 +5572,13 @@ def render_intake_and_search(
                         ("Checkpoints", count_payload.get("checkpoints", 0)),
                         ("Geofences", count_payload.get("geofences", 0)),
                         ("Cameras", count_payload.get("cameras", 0)),
+                        ("Attribute Facts", count_payload.get("attribute_facts", 0)),
+                        ("Resolution Candidates", count_payload.get("resolution_candidates", 0)),
+                        ("Connector Artifacts", count_payload.get("connector_artifacts", 0)),
+                        ("Provenance", count_payload.get("provenance_records", 0)),
+                        ("Corridors", count_payload.get("corridors", 0)),
+                        ("Playbooks", count_payload.get("playbooks", 0)),
+                        ("Video Sessions", count_payload.get("video_sessions", 0)),
                     ]
                 )
                 render_table(
@@ -5067,6 +5688,7 @@ with st.sidebar:
             "Mission Control",
             "Geo Command",
             "Graph Fabric",
+            "Connector Ops",
             "Camera Command",
             "Fusion Center",
             "Case Dossier",
@@ -5092,6 +5714,8 @@ elif workspace == "Geo Command":
     render_geo_command(district_scope)
 elif workspace == "Graph Fabric":
     render_graph_fabric(district_scope, selected_case_id)
+elif workspace == "Connector Ops":
+    render_connector_ops(district_scope, selected_case_id)
 elif workspace == "Camera Command":
     render_camera_command(district_scope, selected_case_id)
 elif workspace == "Fusion Center":

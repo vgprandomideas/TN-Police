@@ -1,5 +1,6 @@
 
 import csv
+from datetime import datetime
 import json
 import math
 from pathlib import Path
@@ -11,6 +12,8 @@ from db.models import (
     Case,
     CaseTimelineEvent,
     CheckpointPlan,
+    ConnectorArtifact,
+    ConnectorRun,
     ConnectorRegistry,
     DepartmentMessage,
     EvidenceAttachment,
@@ -19,8 +22,11 @@ from db.models import (
     GeofenceZone,
     GraphSavedView,
     Incident,
+    OntologyClass,
+    OntologyRelationType,
     NarrativeBrief,
     NotificationEvent,
+    OperationalCorridor,
     PersonnelPresence,
     Role,
     Station,
@@ -29,6 +35,8 @@ from db.models import (
     TaskQueue,
     TimelineDigest,
     User,
+    VideoSession,
+    WorkflowPlaybook,
 )
 from services.auth import hash_password
 from adapters.sanctioned_connectors import SANCTIONED_CONNECTORS
@@ -641,6 +649,174 @@ def seed_dispatch_workflow(db):
             )
     db.commit()
 
+
+def seed_ontology_and_playbooks(db):
+    ontology_classes = [
+        ("person", "Person", "Individual suspect, victim, witness, or officer profile.", "core", json.dumps(["full_name", "dob", "phone", "address", "identifier"])),
+        ("phone", "Phone", "Subscriber number or handset-associated phone reference.", "communications", json.dumps(["number", "carrier", "sim_ref"])),
+        ("device", "Device", "IMEI, handset, laptop, or recovered digital device.", "digital", json.dumps(["imei", "serial_no", "model"])),
+        ("vehicle", "Vehicle", "Vehicle registration and movement subject.", "mobility", json.dumps(["registration_no", "vehicle_type", "color"])),
+        ("account", "Account", "Bank or wallet account linked to movement of funds.", "financial", json.dumps(["account_no", "wallet_id", "bank"])),
+        ("organization", "Organization", "Company, beneficiary, or shell entity.", "financial", json.dumps(["gst_no", "registration_no", "name"])),
+        ("location", "Location", "Premises, hotspot, corridor, warehouse, or junction.", "geo", json.dumps(["address", "latitude", "longitude"])),
+        ("case", "Case", "Investigative case object.", "operations", json.dumps(["title", "priority", "status"])),
+    ]
+    for class_name, display_name, description, category, attribute_schema_json in ontology_classes:
+        if not db.query(OntologyClass).filter_by(class_name=class_name).first():
+            db.add(
+                OntologyClass(
+                    class_name=class_name,
+                    display_name=display_name,
+                    description=description,
+                    category=category,
+                    attribute_schema_json=attribute_schema_json,
+                )
+            )
+
+    relation_types = [
+        ("uses", "person", "device", "Person uses or operated the device.", "directed", "high"),
+        ("registered_to", "device", "phone", "Device is registered to the phone or SIM.", "directed", "medium"),
+        ("travels_in", "person", "vehicle", "Person was observed traveling in a vehicle.", "directed", "medium"),
+        ("linked_transfer", "device", "account", "Digital device linked to financial transfer corridor.", "directed", "medium"),
+        ("bank_beneficiary", "organization", "account", "Organization is a beneficiary or front for an account.", "directed", "medium"),
+        ("location_overlap", "location", "location", "Operational overlap between locations or zones.", "bidirectional", "medium"),
+    ]
+    for relation_name, source_class, target_class, description, directionality, confidence_band in relation_types:
+        if not db.query(OntologyRelationType).filter_by(relation_name=relation_name).first():
+            db.add(
+                OntologyRelationType(
+                    relation_name=relation_name,
+                    source_class=source_class,
+                    target_class=target_class,
+                    description=description,
+                    directionality=directionality,
+                    confidence_band=confidence_band,
+                )
+            )
+
+    playbooks = [
+        ("Chennai", "Cyber Fraud Freeze Playbook", "watchlist_hit", "high", "Cyber Cell Chennai", json.dumps(["validate complaint linkage", "freeze bank trail", "escalate beneficiary account", "assign device correlation"])),
+        ("Coimbatore", "SIM Swap Sweep Playbook", "fusion_cluster", "critical", "Cyber Mobile Team 2", json.dumps(["validate subscriber overlap", "create corridor checkpoint", "screen linked devices", "issue carrier alert"])),
+        ("Madurai", "Retaliation Patrol Saturation", "hotspot_forecast", "high", "District Patrol Unit", json.dumps(["issue patrol brief", "open perimeter task", "raise war-room snapshot", "align station sector map"])),
+    ]
+    for district, playbook_name, trigger_type, default_priority, assigned_unit_hint, action_template_json in playbooks:
+        if not db.query(WorkflowPlaybook).filter_by(district=district, playbook_name=playbook_name).first():
+            db.add(
+                WorkflowPlaybook(
+                    district=district,
+                    playbook_name=playbook_name,
+                    trigger_type=trigger_type,
+                    default_priority=default_priority,
+                    assigned_unit_hint=assigned_unit_hint,
+                    action_template_json=action_template_json,
+                )
+            )
+    db.commit()
+
+
+def seed_connector_runs_and_sessions(db):
+    connector_runs = [
+        ("tn_cctns_citizen_portal", "poll", "completed", 42, 18, 1240, "Citizen complaint sync completed."),
+        ("national_cybercrime_portal", "poll", "completed", 28, 11, 1680, "Cyber complaint aggregation sync completed."),
+        ("patrol_reporting_ingest", "stream", "running", 64, 64, 320, "Patrol mobile updates actively streaming."),
+    ]
+    for connector_name, run_mode, status, records_seen, records_emitted, latency_ms, notes in connector_runs:
+        if db.query(ConnectorRun).filter_by(connector_name=connector_name, notes=notes).first():
+            continue
+        db.add(
+            ConnectorRun(
+                connector_name=connector_name,
+                run_mode=run_mode,
+                status=status,
+                records_seen=records_seen,
+                records_emitted=records_emitted,
+                latency_ms=latency_ms,
+                notes=notes,
+                finished_at=datetime.utcnow() if status == "completed" else None,
+            )
+        )
+    db.commit()
+
+    latest_runs = {row.connector_name: row.id for row in db.query(ConnectorRun).order_by(ConnectorRun.id.desc()).all()}
+    connector_artifacts = [
+        (latest_runs.get("tn_cctns_citizen_portal"), "tn_cctns_citizen_portal", "complaint", "CMP-REF-001", "Chennai", None, None, "Wallet-scam complaint artifact synchronized from citizen portal."),
+        (latest_runs.get("national_cybercrime_portal"), "national_cybercrime_portal", "complaint", "CBE-REF-017", "Coimbatore", None, None, "SIM-swap complaint artifact synchronized from cybercrime portal."),
+        (latest_runs.get("patrol_reporting_ingest"), "patrol_reporting_ingest", "patrol_update", "PATROL-NIGHT-22", "Madurai", None, None, "Night patrol grid report ingested from internal reporting lane."),
+    ]
+    for connector_run_id, connector_name, record_type, external_ref, district, case_id, entity_id, ingest_summary in connector_artifacts:
+        if not connector_run_id:
+            continue
+        if db.query(ConnectorArtifact).filter_by(connector_run_id=connector_run_id, external_ref=external_ref).first():
+            continue
+        db.add(
+            ConnectorArtifact(
+                connector_run_id=connector_run_id,
+                connector_name=connector_name,
+                record_type=record_type,
+                external_ref=external_ref,
+                district=district,
+                case_id=case_id,
+                entity_id=entity_id,
+                ingest_summary=ingest_summary,
+                status="ingested",
+            )
+        )
+
+    session_code = "tn-police-state-command-ops"
+    if not db.query(VideoSession).filter_by(session_code=session_code).first():
+        db.add(
+            VideoSession(
+                room_name="State Command Net",
+                district=None,
+                case_id=None,
+                session_code=session_code,
+                session_mode="webrtc_mesh",
+                status="active",
+                notes="Seeded statewide command briefing session scaffold.",
+                started_by="admin_tn",
+            )
+        )
+    db.commit()
+
+
+def seed_operational_corridors(db):
+    district_csv_path = Path(__file__).resolve().parents[1] / "data" / "tn_district_coordinates.csv"
+    district_lookup = {}
+    if district_csv_path.exists():
+        with open(district_csv_path, newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                district_lookup[row["district"]] = (float(row["latitude"]), float(row["longitude"]))
+
+    corridor_specs = [
+        ("Chennai", "North Port Fraud Corridor", "cargo_watch", "vehicle-1", ["Chennai", "Chengalpattu", "Cuddalore"], 0.86, "high"),
+        ("Coimbatore", "Avinashi Device Sweep Corridor", "device_sweep", "suspect-1", ["Coimbatore", "Erode", "Salem"], 0.78, "high"),
+        ("Madurai", "South Junction Response Corridor", "patrol", "vehicle-2", ["Madurai", "Thoothukudi", "Tirunelveli"], 0.73, "medium"),
+    ]
+    for district, corridor_name, corridor_type, route_ref, districts, risk_score, surveillance_priority in corridor_specs:
+        if db.query(OperationalCorridor).filter_by(district=district, corridor_name=corridor_name).first():
+            continue
+        points = []
+        for district_name in districts:
+            latitude, longitude = district_lookup.get(district_name, (None, None))
+            if latitude is None or longitude is None:
+                continue
+            points.append({"district": district_name, "latitude": round(latitude, 6), "longitude": round(longitude, 6)})
+        if not points:
+            continue
+        db.add(
+            OperationalCorridor(
+                district=district,
+                corridor_name=corridor_name,
+                corridor_type=corridor_type,
+                route_ref=route_ref,
+                points_json=json.dumps(points),
+                risk_score=risk_score,
+                surveillance_priority=surveillance_priority,
+                notes="Seeded corridor layer aligned to route intelligence and district-to-district flow pressure.",
+            )
+        )
+    db.commit()
+
 def main():
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -658,6 +834,9 @@ def main():
         seed_camera_assets_and_assignments(db)
         seed_graph_saved_views(db)
         seed_dispatch_workflow(db)
+        seed_ontology_and_playbooks(db)
+        seed_connector_runs_and_sessions(db)
+        seed_operational_corridors(db)
     finally:
         db.close()
 
